@@ -1,0 +1,66 @@
+# Policy for the PingFederate-compatible demo authorization server.
+# The same objects map 1:1 onto PingFederate configuration (see pingfederate/README.md):
+#   users            -> Password Credential Validator + attribute contract
+#   clients          -> OAuth clients
+#   agent ceilings   -> per-client "Restrict scopes" on the token-exchange client
+#
+# Delegated scope = (scopes in the user's token)
+#                 ∩ (scopes the agent client is allowed)
+#                 ∩ (scopes the agent requested for this task)
+
+scopes:
+  openid:          OpenID Connect sign-in
+  profile:         Basic profile
+  email:           Email address
+  systems:read:    Read system inventory and status
+  systems:analyze: Run diagnostics against a system
+  metrics:read:    Read telemetry for a system
+  tickets:read:    Read incident tickets
+  tickets:write:   Open or update incident tickets
+
+users:
+  alice:
+    password: alice
+    name: Alice Rivera
+    email: alice@demo.local
+    groups: [sre-leads]
+    # Alice is entitled to everything, including opening tickets.
+    entitlements: [systems:read, systems:analyze, metrics:read, tickets:read, tickets:write]
+  bob:
+    password: bob
+    name: Bob Chen
+    email: bob@demo.local
+    groups: [analysts]
+    # Bob can look, but cannot run diagnostics or touch tickets.
+    entitlements: [systems:read, metrics:read]
+
+clients:
+  agentic-ai-portal:
+    description: Agentic AI Service (user-facing web app)
+    client_secret: portal-secret
+    grant_types: [authorization_code]
+    require_pkce: true
+    redirect_uris: [http://localhost:8080/callback]
+    allowed_scopes: [openid, profile, email, systems:read, systems:analyze, metrics:read, tickets:read, tickets:write]
+    access_token_audience: agentic-ai-service
+    access_token_ttl: 900
+
+  analysis-agent:
+    description: Read-only analysis agent
+    token_endpoint_auth_method: tls_client_auth            # RFC 8705 mTLS client auth
+    tls_client_auth_san_uri: spiffe://demo.local/agent/analysis-agent
+    grant_types: [urn:ietf:params:oauth:grant-type:token-exchange]
+    allowed_scopes: [systems:read, systems:analyze, metrics:read, tickets:read]
+    allowed_resources: [https://systems-api:8443, https://ops-mcp:8443/mcp]
+    subject_token_audiences: [agentic-ai-service]          # whose user tokens it may exchange
+    access_token_ttl: 300
+
+  remediation-agent:
+    description: Remediation agent (may open tickets, cannot run diagnostics)
+    token_endpoint_auth_method: tls_client_auth
+    tls_client_auth_san_uri: spiffe://demo.local/agent/remediation-agent
+    grant_types: [urn:ietf:params:oauth:grant-type:token-exchange]
+    allowed_scopes: [systems:read, tickets:read, tickets:write]
+    allowed_resources: [https://systems-api:8443, https://ops-mcp:8443/mcp]
+    subject_token_audiences: [agentic-ai-service]
+    access_token_ttl: 300

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agentic AI Service</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#1b1f24;--mute:#5f6b7a;--line:#e3e6ea;--accent:#2457d6;--ok:#1a7f4b;--warn:#b26a00;--bad:#c0362c;--chip:#eef2fb;--code:#f3f4f6}
+@media (prefers-color-scheme:dark){:root{--bg:#111418;--card:#1a1e24;--ink:#e6e8eb;--mute:#9aa4b1;--line:#2b313a;--accent:#7aa2ff;--ok:#4cc38a;--warn:#e0a03a;--bad:#ff7b72;--chip:#232b3a;--code:#14181d}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 24px;border-bottom:1px solid var(--line);background:var(--card)}
+header b{font-size:17px} header .who{color:var(--mute);font-size:14px}
+main{max-width:1100px;margin:0 auto;padding:24px 16px}
+a{color:var(--accent)} .btn{display:inline-block;background:var(--accent);color:#fff;border:0;border-radius:6px;padding:9px 16px;font-size:14px;text-decoration:none;cursor:pointer}
+.btn.ghost{background:transparent;color:var(--accent);border:1px solid var(--line)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin-bottom:18px}
+h2{font-size:17px;margin:0 0 12px} h3{font-size:15px;margin:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px}
+.mute{color:var(--mute)} .small{font-size:13px}
+pre{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:10px;overflow:auto;font-size:12px;max-height:340px;margin:8px 0 0}
+code{font-size:13px;background:var(--code);padding:1px 4px;border-radius:4px}
+label{display:block;font-size:13px;color:var(--mute);margin:10px 0 4px}
+select,input[type=text]{width:100%;padding:8px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--ink);font-size:14px}
+.chip{display:inline-block;background:var(--chip);border-radius:999px;padding:1px 9px;margin:2px 3px 2px 0;font-size:12px;font-family:ui-monospace,monospace}
+.chip.g{background:color-mix(in srgb,var(--ok) 18%,transparent)} .chip.x{background:color-mix(in srgb,var(--bad) 15%,transparent);text-decoration:line-through}
+.step{display:grid;grid-template-columns:40px 1fr;gap:12px;padding:12px 0;border-top:1px solid var(--line)}
+.step:first-child{border-top:0}
+.num{width:32px;height:32px;border-radius:50%;display:grid;place-items:center;font-weight:600;background:var(--chip);color:var(--accent)}
+.num.ok{background:color-mix(in srgb,var(--ok) 18%,transparent);color:var(--ok)}
+.num.denied,.num.error{background:color-mix(in srgb,var(--bad) 15%,transparent);color:var(--bad)}
+.num.partial{background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}
+.actor{font-size:12px;color:var(--mute)} details summary{cursor:pointer;font-size:13px;color:var(--accent)}
+table{width:100%;border-collapse:collapse;font-size:13px;margin-top:6px} td,th{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+.allowed{color:var(--ok);font-weight:600}.deny{color:var(--bad);font-weight:600}
+.scopes td:first-child{white-space:nowrap;color:var(--mute);width:150px}
+.sev{font-weight:700;text-transform:uppercase}.sev.high,.sev.critical{color:var(--bad)}.sev.medium{color:var(--warn)}.sev.ok,.sev.low{color:var(--ok)}
+.summary{white-space:pre-wrap;font-size:14px}
+</style></head><body>
+<header><b>Agentic AI Service</b>
+<div class="who">{% if user %}Signed in as <b>{{ user.id_claims.name }}</b> ({{ user.id_claims.sub }}) &nbsp;
+<a class="btn ghost" href="/logout">Sign out</a>{% endif %}</div></header>
+<main>{% block body %}{% endblock %}</main></body></html>

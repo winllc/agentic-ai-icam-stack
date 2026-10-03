@@ -1,0 +1,33 @@
+{% extends "base.html" %}{% from "_macros.html" import step, scopes %}
+{% block body %}
+{% if not user %}
+<div class="card"><h2>Delegated, identity-aware AI agents</h2>
+<p>Sign in through PingFederate (OIDC + PKCE). Then give an AI agent a task. The agent gets its own workload identity
+from SPIRE (an X.509-SVID) and exchanges your token for a <b>delegated token</b> limited to
+<i>your entitlements ∩ the agent's allowed scope ∩ what the task requests</i>, bound to the agent's certificate.</p>
+<p class="small mute">Identity provider: <code>{{ issuer }}</code></p>
+<a class="btn" href="/login">Sign in with PingFederate</a></div>
+{% else %}
+<div class="grid">
+ <div class="card"><h2>Ask an agent</h2>
+  <form method="post" action="/task">
+   <label>Agent</label><select name="agent">{% for k, a in agents.items() %}<option value="{{ k }}">{{ a.label }}</option>{% endfor %}</select>
+   <label>System</label><select name="system">{% for k, n in systems.items() %}<option value="{{ k }}">{{ n }} ({{ k }})</option>{% endfor %}</select>
+   <label>Task</label><input type="text" name="task" placeholder="Analyze system X">
+   <div style="margin-top:14px"><button class="btn" type="submit">Run task</button></div>
+  </form></div>
+ <div class="card"><h2>Your session</h2>
+  <table class="scopes">{{ scopes('Access token scope', user.at_claims.scope) }}
+  <tr><td>Groups</td><td>{% for g in user.id_claims.groups %}<span class="chip">{{ g }}</span>{% endfor %}</td></tr>
+  <tr><td>Token audience</td><td><code>{{ user.at_claims.aud }}</code></td></tr></table>
+  <details><summary>ID token claims</summary><pre>{{ user.id_claims | pretty }}</pre></details>
+  <details><summary>Access token claims</summary><pre>{{ user.at_claims | pretty }}</pre></details>
+ </div>
+</div>
+<div class="card"><h2>Sign-in flow</h2>{% for s in user.login_steps %}{{ step(s) }}{% endfor %}</div>
+{% if user.results %}<div class="card"><h2>Recent tasks</h2><table><tr><th>Time</th><th>Agent</th><th>System</th><th>Delegated scope</th><th>Severity</th></tr>
+{% for r in user.results %}<tr><td>{{ r.at }}</td><td>{{ r.agent }}</td><td>{{ r.system }}</td>
+<td>{% for s in ((r.delegated_token or {}).claims or {}).get('scope','').split() %}<span class="chip g">{{ s }}</span>{% endfor %}{% if r.error %}<span class="deny">{{ r.error }}</span>{% endif %}</td>
+<td>{% if r.findings %}<span class="sev {{ r.findings.severity }}">{{ r.findings.severity }}</span>{% endif %}</td></tr>{% endfor %}</table></div>{% endif %}
+{% endif %}
+{% endblock %}

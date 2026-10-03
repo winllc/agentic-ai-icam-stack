@@ -1,0 +1,211 @@
+# Agentic AI ICAM demo stack
+#
+#   User ─► Agentic AI Service ─(OIDC+PKCE)─► PingFederate
+#             │ task + user token
+#             ▼
+#           Agent Runtime ─► Agent Instance ─(Workload API)─► SPIRE Agent ─► SPIRE Server
+#                                 │  X.509-SVID
+#                                 ├─(Token Exchange + mTLS)─► PingFederate ─► delegated token
+#                                 └─(mTLS + bound token)───► Enterprise Resources (REST API, MCP server)
+#
+# `docker compose up --build` then open http://localhost:8080 (alice/alice or bob/bob).
+
+name: agentic-icam
+
+x-spire-version: &spire-version ${SPIRE_VERSION:-1.13.3}
+
+x-python-service: &python-service
+  build: ./services
+  image: agentic-icam/services:latest
+  restart: unless-stopped
+  depends_on:
+    spire-agent:
+      condition: service_healthy
+  volumes:
+    - spire-agent-socket:/run/spire/sockets:ro
+
+x-python-env: &python-env
+  SPIFFE_ENDPOINT_SOCKET: unix:///run/spire/sockets/agent.sock
+  # Browser-facing issuer vs. the name containers use to reach the AS.
+  PF_ISSUER: http://localhost:9031
+  PF_INTERNAL_BASE: http://pingfederate:9031
+  PF_JWKS_URL: http://pingfederate:9031/pf/JWKS
+  PF_DISCOVERY_URL: http://pingfederate:9031/.well-known/openid-configuration
+  NO_PROXY: pingfederate,systems-api,ops-mcp,analysis-agent,remediation-agent,localhost
+  no_proxy: pingfederate,systems-api,ops-mcp,analysis-agent,remediation-agent,localhost
+
+x-tcp-health: &tcp-health
+  test: ["CMD", "python", "-c", "import os, socket; socket.create_connection(('localhost', int(os.environ['HEALTH_PORT'])), 2)"]
+  interval: 5s
+  timeout: 3s
+  retries: 30
+  start_period: 5s
+
+x-healthcheck: &http-health
+  interval: 5s
+  timeout: 3s
+  retries: 30
+  start_period: 5s
+
+services:
+  # ------------------------------------------------------------------ SPIRE
+  pki-init:
+    build:
+      context: ./spire/tools
+      args:
+        SPIRE_VERSION: *spire-version
+    image: agentic-icam/spire-tools:latest
+    command: ["pki-init.sh"]
+    volumes:
+      - spire-pki:/pki
+      - spire-server-data:/spire-server-data
+      - spire-server-socket:/spire-server-socket
+
+  spire-server:
+    image: ghcr.io/spiffe/spire-server:${SPIRE_VERSION:-1.13.3}
+    command: ["-config", "/opt/spire/conf/server/server.conf"]
+    restart: unless-stopped
+    depends_on:
+      pki-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./spire/server/server.conf:/opt/spire/conf/server/server.conf:ro
+      - spire-pki:/opt/spire/pki:ro
+      - spire-server-data:/var/lib/spire/server/data
+      - spire-server-socket:/tmp/spire-server/private
+    healthcheck:
+      test: ["CMD", "/opt/spire/bin/spire-server", "healthcheck", "-socketPath", "/tmp/spire-server/private/api.sock"]
+      <<: *http-health
+
+  spire-register:
+    image: agentic-icam/spire-tools:latest
+    command: ["register.sh"]
+    depends_on:
+      pki-init:
+        condition: service_completed_successfully
+      spire-server:
+        condition: service_healthy
+    volumes:
+      - spire-pki:/pki
+      - spire-server-socket:/tmp/spire-server/private
+
+  spire-agent:
+    image: ghcr.io/spiffe/spire-agent:${SPIRE_VERSION:-1.13.3}
+    command: ["-config", "/opt/spire/conf/agent/agent.conf"]
+    restart: unless-stopped
+    user: "0"
+    # The docker WorkloadAttestor resolves caller PIDs to containers, so it needs
+    # the host PID + cgroup namespaces and read access to the Docker API.
+    pid: host
+    cgroup: host
+    depends_on:
+      spire-register:
+        condition: service_completed_successfully
+    volumes:
+      - ./spire/agent/agent.conf:/opt/spire/conf/agent/agent.conf:ro
+      - spire-pki:/opt/spire/pki:ro
+      - spire-agent-socket:/run/spire/sockets
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro
+    healthcheck:
+      test: ["CMD", "/opt/spire/bin/spire-agent", "healthcheck", "-socketPath", "/run/spire/sockets/agent.sock"]
+      <<: *http-health
+
+  # ------------------------------------------------------------------ Identity provider
+  pingfederate:
+    <<: *python-service
+    command: ["python", "-m", "icam.idp.app"]
+    labels:
+      ai.demo.spiffe-workload: pingfederate
+    environment:
+      <<: *python-env
+      PF_POLICY: /config/idp-policy.yaml
+      PF_MTLS_BASE: https://pingfederate:9443
+      DEMO_EXPLAIN: "true"
+    volumes:
+      - spire-agent-socket:/run/spire/sockets:ro
+      - ./config/idp-policy.yaml:/config/idp-policy.yaml:ro
+    ports:
+      - "9031:9031"   # browser + back channel
+      - "9443:9443"   # mTLS token endpoint alias
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9031/healthz')"]
+      <<: *http-health
+
+  # ------------------------------------------------------------------ Agentic AI Service
+  agentic-ai-service:
+    <<: *python-service
+    command: ["python", "-m", "icam.portal.app"]
+    environment:
+      <<: *python-env
+      HEALTH_PORT: "8080"
+      OIDC_CLIENT_ID: agentic-ai-portal
+      OIDC_CLIENT_SECRET: portal-secret
+      OIDC_REDIRECT_URI: http://localhost:8080/callback
+      PUBLIC_URL: http://localhost:8080
+    depends_on:
+      pingfederate:
+        condition: service_healthy
+    volumes: []
+    ports:
+      - "8080:8080"
+    healthcheck: *tcp-health
+
+  # ------------------------------------------------------------------ Agent runtimes
+  analysis-agent:
+    <<: *python-service
+    command: ["python", "-m", "icam.agent.runtime"]
+    labels:
+      ai.demo.spiffe-workload: analysis-agent
+    environment:
+      <<: *python-env
+      HEALTH_PORT: "8090"
+      AGENT_NAME: analysis-agent
+      SYSTEMS_API_URL: https://systems-api:8443
+      OPS_MCP_URL: https://ops-mcp:8443/mcp
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-5-5}
+    healthcheck: *tcp-health
+
+  remediation-agent:
+    <<: *python-service
+    command: ["python", "-m", "icam.agent.runtime"]
+    labels:
+      ai.demo.spiffe-workload: remediation-agent
+    environment:
+      <<: *python-env
+      HEALTH_PORT: "8090"
+      AGENT_NAME: remediation-agent
+      SYSTEMS_API_URL: https://systems-api:8443
+      OPS_MCP_URL: https://ops-mcp:8443/mcp
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-5-5}
+    healthcheck: *tcp-health
+
+  # ------------------------------------------------------------------ Enterprise resources
+  systems-api:
+    <<: *python-service
+    command: ["python", "-m", "icam.resources.systems_api"]
+    labels:
+      ai.demo.spiffe-workload: systems-api
+    environment:
+      <<: *python-env
+      HEALTH_PORT: "8443"
+      RESOURCE_URI: https://systems-api:8443
+    healthcheck: *tcp-health
+
+  ops-mcp:
+    <<: *python-service
+    command: ["python", "-m", "icam.resources.ops_mcp"]
+    labels:
+      ai.demo.spiffe-workload: ops-mcp
+    environment:
+      <<: *python-env
+      HEALTH_PORT: "8443"
+      RESOURCE_URI: https://ops-mcp:8443/mcp
+    healthcheck: *tcp-health
+
+volumes:
+  spire-pki:
+  spire-server-data:
+  spire-server-socket:
+  spire-agent-socket:

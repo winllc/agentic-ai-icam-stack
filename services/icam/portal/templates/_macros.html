@@ -1,0 +1,21 @@
+{% macro scopes(label, value, cls='') %}<tr><td>{{ label }}</td><td>{% for s in (value or '').split() %}<span class="chip {{ cls }}">{{ s }}</span>{% else %}<span class="mute small">none</span>{% endfor %}</td></tr>{% endmacro %}
+
+{% macro step(s) %}
+<div class="step"><div class="num {{ s.status }}">{{ s.n }}</div><div>
+<h3>{{ s.title }}</h3><div class="actor">{{ s.actor }}{% if s.status not in ('ok',) %} &middot; <b>{{ s.status }}</b>{% endif %}</div>
+{% set d = s.detail %}
+{% if s.n == 9 and d.policy_evaluation %}
+ {% set p = d.policy_evaluation %}
+ <table class="scopes">{{ scopes('User token', p.user_scopes) }}{{ scopes('Agent allowed', p.agent_scopes) }}{{ scopes('Agent requested', p.requested_scopes) }}{{ scopes('= Delegated', p.granted_scopes, 'g') }}</table>
+ {% if p.denied %}<div class="small" style="margin-top:6px">{% for sc, why in p.denied.items() %}<span class="chip x">{{ sc }}</span> {{ why }}&nbsp; {% endfor %}</div>{% endif %}
+ <div class="small mute" style="margin-top:6px">sub=<code>{{ d.claims.sub }}</code> {% if d.claims.act %}act.sub=<code>{{ d.claims.act.sub }}</code>{% endif %} {% if d.claims.cnf %}cnf.x5t#S256=<code>{{ d.claims.cnf['x5t#S256'][:16] }}…</code>{% endif %}</div>
+{% elif s.n == 10 and d.calls %}
+ <table><tr><th>Type</th><th>Operation</th><th>Scope</th><th>Result</th></tr>
+ {% for c in d.calls %}<tr><td>{{ c.kind }}</td><td><code>{{ c.operation }}</code></td><td><span class="chip">{{ c.scope }}</span></td>
+ <td>{% if c.outcome == 'allowed' %}<span class="allowed">{{ c.http_status }} allowed</span>{% else %}<span class="deny">{{ c.http_status }}</span> <span class="small mute">{{ c.outcome }}</span>{% endif %}</td></tr>{% endfor %}</table>
+{% elif s.n == 7 %}
+ <div class="small">SPIFFE ID <code>{{ d.spiffe_id }}</code> &middot; serial <code>{{ d.serial }}</code> &middot; expires {{ d.not_after }}</div>
+{% endif %}
+<details><summary>details</summary><pre>{{ d | pretty }}</pre></details>
+</div></div>
+{% endmacro %}

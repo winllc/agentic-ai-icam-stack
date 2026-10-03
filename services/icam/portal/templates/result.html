@@ -1,0 +1,15 @@
+{% extends "base.html" %}{% from "_macros.html" import step %}
+{% block body %}
+<p><a href="/">← back</a></p>
+<div class="card"><h2>{{ r.task }}</h2>
+<div class="small mute">agent <code>{{ r.agent }}</code> &middot; system <code>{{ r.system }}</code>{% if r.task_id %} &middot; task {{ r.task_id }}{% endif %}{% if r.elapsed_ms %} &middot; {{ r.elapsed_ms }} ms{% endif %}</div>
+{% if r.error %}<p class="deny">{{ r.error }}</p>{% endif %}
+{% if r.findings %}<p>Severity: <span class="sev {{ r.findings.severity }}">{{ r.findings.severity }}</span></p>{% endif %}
+{% if r.summary %}<div class="summary">{{ r.summary.text }}</div><div class="small mute" style="margin-top:6px">summary engine: {{ r.summary.engine }}{% if r.summary.llm_note %} ({{ r.summary.llm_note }}){% endif %}</div>{% endif %}
+</div>
+<div class="card"><h2>End-to-end trace</h2>
+{% for s in user.login_steps %}{{ step(s) }}{% endfor %}
+{% for s in r.steps %}{{ step(s) }}{% endfor %}
+</div>
+{% if r.data %}<div class="card"><h2>Data the agent was allowed to read</h2><pre>{{ r.data | pretty }}</pre></div>{% endif %}
+{% endblock %}

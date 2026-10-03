@@ -1,0 +1,69 @@
+# Overlay: swap the PingFederate-compatible simulator for a real PingFederate.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.pingfederate.yml up -d
+#
+# Requires Ping DevOps credentials (evaluation license) in .env, and PingFederate
+# configured as described in pingfederate/README.md. Not validated end-to-end by
+# the stack's automated checks (they run against the simulator).
+
+x-real-pf-env: &real-pf-env
+  PF_ISSUER: ${PF_ISSUER:-https://localhost:9031}
+  PF_INTERNAL_BASE: https://pingfederate:9031
+  PF_DISCOVERY_URL: https://pingfederate:9031/.well-known/openid-configuration
+  PF_JWKS_URL: ${PF_JWKS_URL:-https://pingfederate:9031/pf/JWKS}
+  PF_TLS_CA: /pf-trust/pf-ca.pem            # PingFederate's runtime TLS cert / CA
+  REQUESTS_CA_BUNDLE: /pf-trust/pf-ca.pem
+
+services:
+  pingfederate:
+    image: pingidentity/pingfederate:${PF_IMAGE_TAG:-latest}
+    build: !reset null
+    command: !reset null
+    labels: !reset {}
+    depends_on: !reset {}
+    healthcheck: !reset null
+    environment: !override
+      PING_IDENTITY_ACCEPT_EULA: "YES"
+      PING_IDENTITY_DEVOPS_USER: ${PING_IDENTITY_DEVOPS_USER:?set PING_IDENTITY_DEVOPS_USER in .env}
+      PING_IDENTITY_DEVOPS_KEY: ${PING_IDENTITY_DEVOPS_KEY:?set PING_IDENTITY_DEVOPS_KEY in .env}
+      SERVER_PROFILE_URL: ${PF_SERVER_PROFILE_URL:-}
+      SERVER_PROFILE_PATH: ${PF_SERVER_PROFILE_PATH:-}
+    volumes: !override
+      # SPIRE trust bundle: import it as a trusted CA so PingFederate can
+      # authenticate agents by their X.509-SVIDs (tls_client_auth).
+      - spire-pki:/opt/spire-pki:ro
+    ports: !override
+      - "9031:9031"   # runtime (HTTPS)
+      - "9999:9999"   # admin console / admin API
+
+  agentic-ai-service:
+    environment:
+      <<: *real-pf-env
+      OIDC_CLIENT_SECRET: ${PF_PORTAL_CLIENT_SECRET:-portal-secret}
+    volumes: !override
+      - ./pingfederate/trust:/pf-trust:ro
+    depends_on: !override
+      pingfederate:
+        condition: service_started
+
+  analysis-agent: &agent-overrides
+    environment:
+      <<: *real-pf-env
+      # PingFederate's mTLS listener (secondary HTTPS port) if not advertised via mtls_endpoint_aliases.
+      PF_MTLS_TOKEN_ENDPOINT: ${PF_MTLS_TOKEN_ENDPOINT:-}
+    volumes:
+      - spire-agent-socket:/run/spire/sockets:ro
+      - ./pingfederate/trust:/pf-trust:ro
+
+  remediation-agent: *agent-overrides
+
+  systems-api: &resource-overrides
+    environment:
+      <<: *real-pf-env
+      REQUIRE_CNF: ${PF_REQUIRE_CNF:-true}
+      REQUIRE_ACT: ${PF_REQUIRE_ACT:-true}
+    volumes:
+      - spire-agent-socket:/run/spire/sockets:ro
+      - ./pingfederate/trust:/pf-trust:ro
+
+  ops-mcp: *resource-overrides
