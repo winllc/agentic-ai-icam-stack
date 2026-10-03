@@ -1,0 +1,74 @@
+"""Helpers shared by the test scripts: detect which identity provider the stack runs
+(the simulator or a real PingFederate) and drive the browser login form."""
+import html
+import os
+import re
+import subprocess
+import tempfile
+from urllib.parse import urljoin
+
+import requests
+
+PORTAL = "http://localhost:8080"
+
+
+def _ca_from_configurator() -> str | None:
+    out = subprocess.run(["docker", "exec", "agentic-icam-pf-configurator-1", "cat", "/pf-trust/pf-ca.pem"],
+                         capture_output=True, text=True)
+    if out.returncode != 0 or "BEGIN CERTIFICATE" not in out.stdout:
+        return None
+    path = os.path.join(tempfile.gettempdir(), "agentic-icam-pf-ca.pem")
+    with open(path, "w") as f:
+        f.write(out.stdout)
+    return path
+
+
+class Stack:
+    def __init__(self):
+        self.ca = _ca_from_configurator()
+        self.real_pf = self.ca is not None
+        if self.real_pf:   # real PingFederate: HTTPS everywhere, mTLS on the secondary port
+            self.pf = "https://localhost:9031"
+            self.mtls_token_endpoint = "https://pingfederate:9032/as/token.oauth2"
+            self.container_ca = "/pf-trust/pf-ca.pem"
+        else:              # simulator
+            self.pf = "http://localhost:9031"
+            self.mtls_token_endpoint = "https://pingfederate:9443/as/token.oauth2"
+            self.container_ca = None   # the simulator's TLS cert is an SVID: trust the SPIFFE bundle
+        self.name = "PingFederate" if self.real_pf else "PingFederate simulator"
+
+    def session(self) -> requests.Session:
+        s = requests.Session()
+        s.trust_env = False
+        if self.ca:
+            s.verify = self.ca
+        return s
+
+    def submit_login(self, s: requests.Session, page: requests.Response, user: str, password: str):
+        """Fill and post whichever login form the IdP served; returns the final response
+        (or the redirect to the client when allow_redirects=False semantics are needed)."""
+        form = re.search(r"<form[^>]*>", page.text).group(0)
+        action = re.search(r'action="([^"]*)"', form)
+        url = urljoin(page.url, html.unescape(action.group(1))) if action and action.group(1) else page.url
+        fields = {m[0]: html.unescape(m[1]) for m in
+                  re.findall(r'<input[^>]*type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"', page.text)}
+        fields.update({m[0]: html.unescape(m[1]) for m in
+                       re.findall(r'<input[^>]*name="([^"]+)"[^>]*type="hidden"[^>]*value="([^"]*)"', page.text)})
+        fields.update({"pf.username": user, "pf.pass": password, "pf.ok": "clicked"})
+        fields.pop("pf.cancel", None)
+        return s.post(url, data=fields, allow_redirects=False)
+
+    def follow_to(self, s: requests.Session, r: requests.Response, prefix: str) -> requests.Response:
+        """Follow redirects until one points at `prefix` (returned unfollowed)."""
+        while r.status_code in (301, 302, 303) and not r.headers["Location"].startswith(prefix):
+            r = s.get(urljoin(r.url, r.headers["Location"]), allow_redirects=False)
+        return r
+
+    def portal_login(self, user: str) -> requests.Session:
+        s = self.session()
+        page = s.get(f"{PORTAL}/login")
+        assert "pf.username" in page.text, page.text[:300]
+        r = self.follow_to(s, self.submit_login(s, page, user, user), PORTAL)
+        s.get(r.headers["Location"])          # portal /callback -> /
+        assert "Signed in as" in s.get(PORTAL + "/").text, "login failed"
+        return s

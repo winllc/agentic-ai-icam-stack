@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 pingfederate/trust/*.pem
+
+# PingFederate license (never commit)
+pingfederate/license/*.lic

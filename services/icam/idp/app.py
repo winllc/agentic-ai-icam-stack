@@ -299,6 +299,8 @@ def grant_token_exchange():
 
     # --- 4. Scope: User ∩ Agent ∩ Requested.
     user_scopes = scopes_of(subject) - {"openid", "profile", "email"}
+    if "entitlements" in subject:
+        user_scopes &= set(subject["entitlements"].split())
     agent_scopes = set(client["allowed_scopes"])
     requested = set(request.form.get("scope", "").split()) or agent_scopes
     granted = user_scopes & agent_scopes & requested
@@ -308,9 +310,12 @@ def grant_token_exchange():
         "denied": {s: ("not entitled (user)" if s not in user_scopes else "not allowed for agent")
                    for s in sorted(requested - granted)},
     }
-    if not granted:
+    # Like PingFederate: never silently narrow - a request outside User ∩ Agent is rejected,
+    # so the agent must ask for exactly what it may have.
+    if requested - granted or not granted:
         record("token_exchange_denied", user=subject["sub"], agent=client_id, **evaluation)
-        return oauth_error("invalid_scope", "intersection of user, agent and requested scope is empty")
+        return oauth_error("invalid_scope", "requested scope must be within user ∩ agent: "
+                           + ", ".join(f"{s} ({why})" for s, why in evaluation["denied"].items()) or "empty")
 
     now = int(time.time())
     ttl = client.get("access_token_ttl", 300)

@@ -23,6 +23,7 @@ log = logs.setup("agentic-ai-service")
 
 ISSUER = os.environ["PF_ISSUER"].rstrip("/")                      # browser-facing
 INTERNAL = os.environ.get("PF_INTERNAL_BASE", ISSUER).rstrip("/")  # container-facing
+PF_TLS = os.environ.get("PF_TLS_CA") or True                      # CA for PingFederate's HTTPS
 CLIENT_ID = os.environ.get("OIDC_CLIENT_ID", "agentic-ai-portal")
 CLIENT_SECRET = os.environ.get("OIDC_CLIENT_SECRET", "portal-secret")
 REDIRECT_URI = os.environ.get("OIDC_REDIRECT_URI", "http://localhost:8080/callback")
@@ -50,7 +51,7 @@ def backchannel(url: str) -> str:
 
 def discovery() -> dict:
     if not _disco:
-        _disco.update(requests.get(f"{INTERNAL}/.well-known/openid-configuration", timeout=10).json())
+        _disco.update(requests.get(f"{INTERNAL}/.well-known/openid-configuration", timeout=10, verify=PF_TLS).json())
     return _disco
 
 
@@ -95,7 +96,8 @@ def callback():
         abort(400, f"{request.args['error']}: {request.args.get('error_description', '')}")
 
     disco = discovery()
-    resp = requests.post(backchannel(disco["token_endpoint"]), timeout=10, auth=(CLIENT_ID, CLIENT_SECRET), data={
+    resp = requests.post(backchannel(disco["token_endpoint"]), timeout=10, verify=PF_TLS,
+                         auth=(CLIENT_ID, CLIENT_SECRET), data={
         "grant_type": "authorization_code", "code": request.args["code"],
         "redirect_uri": REDIRECT_URI, "code_verifier": pending["verifier"]})
     if not resp.ok:
@@ -113,7 +115,8 @@ def callback():
     at_claims = unverified_claims(tokens["access_token"])
     sid = secrets.token_urlsafe(24)
     store[sid] = {
-        "id_claims": id_claims, "access_token": tokens["access_token"], "at_claims": at_claims,
+        "id_claims": id_claims, "id_token": tokens["id_token"],
+        "access_token": tokens["access_token"], "at_claims": at_claims,
         "expires_at": time.time() + tokens.get("expires_in", 900), "results": [],
         "login_steps": [
             {"n": 1, "title": "User accessed the Agentic AI Service", "actor": "User → Agentic AI Service",
@@ -137,9 +140,14 @@ def callback():
 
 @app.get("/logout")
 def logout():
-    store.pop(session.pop("sid", ""), None)
+    user = store.pop(session.pop("sid", ""), None)
     end = discovery().get("end_session_endpoint")
-    return redirect(f"{end}?{urlencode({'TargetResource': PUBLIC_URL + '/'})}" if end else url_for("index"))
+    if not end:
+        return redirect(url_for("index"))
+    params = {"post_logout_redirect_uri": PUBLIC_URL + "/"}  # OIDC RP-initiated logout
+    if user:
+        params["id_token_hint"] = user["id_token"]
+    return redirect(f"{end}?{urlencode(params)}")
 
 
 # ------------------------------------------------------------------ 4-10: delegate to an agent

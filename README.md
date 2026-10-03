@@ -22,19 +22,29 @@ User ─1─► Agentic AI Service ─2 OIDC+PKCE─► PingFederate ─3 tokens
 
 ## Quick start
 
+Two identity-provider modes share the same services, policy file and tests:
+
 ```bash
+# A) No license needed: PingFederate-compatible simulator
 docker compose up -d --build --wait
-open http://localhost:8080          # sign in as alice/alice or bob/bob
+
+# B) Real PingFederate 13.1 (license file required; see pingfederate/README.md)
+cp /path/to/pingfederate.lic pingfederate/license/pingfederate.lic && chmod 0644 pingfederate/license/pingfederate.lic
+docker compose -f docker-compose.yml -f docker-compose.pingfederate.yml up -d --build --wait
 ```
 
-To check everything from the command line (needs `pip install requests`):
+Open http://localhost:8080 and sign in as `alice/alice` or `bob/bob`. In mode B the login page
+is PingFederate's own, at `https://localhost:9031`. Its certificate comes from a demo CA you can
+trust in your browser.
+
+To check everything from the command line (needs `pip install requests`). Both scripts detect the mode:
 
 ```bash
-python3 scripts/smoke_test.py        # full browser flow, 2 users × 2 agents, asserts scope intersection
-python3 scripts/security_checks.py   # 6 attacks that must fail + 1 positive control
+python3 scripts/smoke_test.py        # browser flow, 2 users × 2 agents, asserts scope intersection + cnf/act
+python3 scripts/security_checks.py   # 8 attacks/policy violations that must fail + 1 positive control
 ```
 
-Stop with `docker compose down`. Add `-v` to also wipe SPIRE state.
+Stop with `docker compose down` (add the same `-f` files in mode B). Add `-v` to wipe all state.
 
 **Requirements:** Docker with Compose v2.24+, on Linux or Docker Desktop. The SPIRE
 Agent uses the docker workload attestor, so it runs with `pid: host`, `cgroup: host`
@@ -50,7 +60,8 @@ model only sees data the delegated token allowed the agent to read.
 | Service | Role in the diagram | Port |
 |---|---|---|
 | `agentic-ai-service` | Agentic AI Service: OIDC client (code + PKCE, confidential), task UI, trace view | `localhost:8080` |
-| `pingfederate` | PingFederate (PingFederate-compatible simulator by default, [real one via overlay](pingfederate/README.md)) | `localhost:9031` HTTP, `9443` mTLS token endpoint |
+| `pingfederate` | PingFederate. Mode A: compatible simulator (`9031` HTTP, `9443` mTLS). Mode B: [PingFederate 13.1](pingfederate/README.md) (`9031` HTTPS, `9032` mTLS, `9999` admin). | `localhost:9031` |
+| `pf-configurator` | Mode B only: configures PingFederate via the admin API from `config/idp-policy.yaml`, keeps SPIRE trust in sync | – |
 | `analysis-agent`, `remediation-agent` | Agent Runtime. Each task runs in a **new agent instance process** | internal `8090` |
 | `spire-server` | SPIRE Server: trust domain `demo.local`, x509pop node attestation | internal |
 | `spire-agent` | SPIRE Agent: Workload API socket, docker workload attestor | internal |
@@ -73,11 +84,12 @@ model only sees data the delegated token allowed the agent to read.
    `docker:label:ai.demo.spiffe-workload=<agent>` against the entries registered under
    the attested node.
 7. **SVID**: the instance receives `spiffe://demo.local/agent/<agent>` (1h TTL, DNS SAN = service name).
-8. **Token exchange**: RFC 8693 request to the RFC 8705 `mtls_endpoint_aliases` token
-   endpoint. The client authenticates with `tls_client_auth`, and the SVID's SAN URI
-   must match the client registration. `subject_token` = user's token;
-   `resource` = the two enterprise resources.
-9. **Delegated token**: `scope = user ∩ agent ceiling ∩ requested`, `sub = user`,
+8. **Token exchange**: RFC 8693 request to PingFederate's mTLS token endpoint. The client
+   authenticates with its SVID: the simulator matches the SAN URI, and PingFederate matches
+   the SVID's subject/issuer DN. `subject_token` = user's token, `resource` = the two
+   enterprise resources. `scope` = what the task needs ∩ the agent's ceiling ∩ the user's
+   scopes. The AS **rejects** anything outside User ∩ Agent; it never silently narrows.
+9. **Delegated token**: `scope` = exactly that intersection, `sub = user`,
    `act.sub = agent SPIFFE ID`, `cnf.x5t#S256 = SVID thumbprint`, `aud = resources`,
    5 min TTL. Exchanging a delegated token again is refused.
 10. **API / MCP calls**: mTLS with the SVID, with the bearer token checked at each resource for
@@ -89,12 +101,12 @@ step 10 shows each call's allow/deny decision.
 
 ## The policy
 
-Defined in [`config/idp-policy.yaml`](config/idp-policy.yaml). Each task requests
-`systems:read systems:analyze metrics:read tickets:read tickets:write`.
+Defined in [`config/idp-policy.yaml`](config/idp-policy.yaml), which both IdP modes enforce. Each task
+needs `systems:read systems:analyze metrics:read tickets:read tickets:write`.
 
 | | analysis-agent ceiling<br>`systems:read systems:analyze metrics:read tickets:read` | remediation-agent ceiling<br>`systems:read tickets:read tickets:write` |
 |---|---|---|
-| **alice** (all five scopes) | `systems:read systems:analyze metrics:read tickets:read`. Wants to open a ticket, gets **403** | `systems:read tickets:read tickets:write`. Opens a ticket, but **can't** see metrics or run diagnostics |
+| **alice** (all five scopes) | `systems:read systems:analyze metrics:read tickets:read`. Tries to open a ticket anyway and gets **403** from the MCP server | `systems:read tickets:read tickets:write`. Opens a ticket, but **can't** see metrics or run diagnostics |
 | **bob** (`systems:read metrics:read`) | `systems:read metrics:read` | `systems:read` |
 
 Neither the user's entitlements nor the agent's ceiling can be exceeded, and an
@@ -102,36 +114,41 @@ agent only gets what the task asked for.
 
 ## Security properties demonstrated (`scripts/security_checks.py`)
 
-| Attack | Stopped by |
+| Attack / violation | Stopped by |
 |---|---|
-| Token exchange without an SVID | mTLS client auth required for the token-exchange grant |
-| Agent B presents its SVID but claims to be agent A | SAN URI must match the client's registered SPIFFE ID |
+| Token exchange without an SVID | mTLS client auth required for the agent clients |
+| Agent B presents its SVID but claims to be agent A | SVID must match the client registration (SAN URI / subject DN) |
+| Agent asks for more than its ceiling | client scope restriction → `invalid_scope` |
+| Agent asks for a scope the user isn't entitled to | AS policy (PingFederate: issuance criterion) |
 | Stolen delegated token replayed by another workload | `cnf.x5t#S256` certificate binding |
 | Agent uses the user's raw token at a resource | audience restriction, no `cnf` |
 | Non-workload client calls a resource | TLS handshake requires a SPIFFE client cert |
-| Re-delegating a delegated token | subject-token audience check / no nested `act` |
+| Re-delegating a delegated token | subject token must be a user token from the portal |
 
 ## Layout
 
 ```
 docker-compose.yml               the stack
-docker-compose.pingfederate.yml  overlay: real PingFederate instead of the simulator
+docker-compose.pingfederate.yml  overlay: real PingFederate 13.1 instead of the simulator
 config/idp-policy.yaml           users, clients, agent ceilings
 spire/                           server/agent config, PKI + registration scripts
 services/icam/
   common/                        Workload API helper, JWT validation
-  idp/                           PingFederate-compatible AS
+  idp/                           PingFederate-compatible AS (simulator)
+  pfconfig/                      admin-API configurator for real PingFederate
   portal/                        Agentic AI Service
   agent/                         runtime (per-task process) + agent instance
   resources/                     systems-api (REST) and ops-mcp (MCP)
-scripts/                         smoke test and security checks
-pingfederate/README.md           mapping onto real PingFederate configuration
+scripts/                         smoke test and security checks (both modes)
+pingfederate/                    real-PingFederate guide; license/ (git-ignored)
 ```
 
 ## Demo shortcuts (not for production)
 
-- In-memory sessions and codes, and a fresh AS signing key on every restart (sign in again after a restart).
-- Plain HTTP for the browser-facing hops and the portal-to-runtime hop. The workload hops use mTLS.
+- In-memory portal sessions. In mode A, the simulator also keeps codes in memory and creates a fresh
+  signing key on every restart, so sign in again after a restart.
+- Plain HTTP for the portal and the portal-to-runtime hop, and in mode A for the IdP's browser endpoints.
+  The workload hops always use mTLS.
 - Workload selectors use a single container label. In production, pin image digests
   (`docker:image_config_digest`) or use the Kubernetes attestor.
 - Werkzeug's development server serves the Python services.

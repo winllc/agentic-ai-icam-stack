@@ -33,6 +33,27 @@ SYSTEMS_API = os.environ.get("SYSTEMS_API_URL", "https://systems-api:8443")
 OPS_MCP = os.environ.get("OPS_MCP_URL", "https://ops-mcp:8443/mcp")
 TASK_SCOPES = os.environ.get("TASK_SCOPES",
                              "systems:read systems:analyze metrics:read tickets:read tickets:write")
+AGENT_POLICY = os.environ.get("AGENT_POLICY", "/config/idp-policy.yaml")
+
+
+def agent_ceiling() -> set[str]:
+    """The scopes this agent's OAuth client is registered for (its "manifest")."""
+    import yaml
+    with open(AGENT_POLICY) as f:
+        return set(yaml.safe_load(f)["clients"][AGENT_NAME]["allowed_scopes"])
+
+
+def user_scopes(claims: dict) -> set[str]:
+    """What the user can delegate: token scope, narrowed by an entitlements claim if present."""
+    scopes = set(claims.get("scope", "").split()) - {"openid", "profile", "email"}
+    if "entitlements" in claims:
+        scopes &= set(str(claims["entitlements"]).split())
+    return scopes
+
+
+def ordered(scopes) -> str:
+    order = TASK_SCOPES.split()
+    return " ".join(sorted(scopes, key=lambda s: order.index(s) if s in order else 99))
 TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
 TT_ACCESS = "urn:ietf:params:oauth:token-type:access_token"
 
@@ -82,15 +103,28 @@ def run(job: dict) -> dict:
     token_ep = os.environ.get("PF_MTLS_TOKEN_ENDPOINT") or backchannel(
         disco.get("mtls_endpoint_aliases", {}).get("token_endpoint") or disco["token_endpoint"])
     resources = [SYSTEMS_API, OPS_MCP]
+    # The AS rejects (never narrows) a request outside User ∩ Agent, so ask for exactly that.
+    user_claims = unverified_claims(job["user_token"])
+    user_set, agent_set, task_set = user_scopes(user_claims), agent_ceiling(), set(TASK_SCOPES.split())
+    request_scope = ordered(task_set & agent_set & user_set)
+    evaluation = {
+        "user_scopes": ordered(user_set), "agent_scopes": ordered(agent_set),
+        "requested_scopes": ordered(task_set),
+        "denied": {s: ("not entitled (user)" if s not in user_set else "not allowed for agent")
+                   for s in sorted(task_set - (user_set & agent_set))},
+    }
     form = {
         "grant_type": TOKEN_EXCHANGE,
         "client_id": AGENT_NAME,
         "subject_token": job["user_token"],
         "subject_token_type": TT_ACCESS,
         "requested_token_type": TT_ACCESS,
-        "scope": TASK_SCOPES,
+        "scope": request_scope,
         "resource": resources,
     }
+    if not request_scope:
+        trace.add(8, "Nothing to delegate", "AI Agent", "denied", **evaluation)
+        return {**result, "steps": trace.steps, "error": "user ∩ agent ∩ task is empty - no token requested"}
     resp = requests.post(token_ep, data=form, cert=identity.client_cert,
                          verify=PF_TLS_CA or str(identity.bundle_path), timeout=15)
     body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
@@ -98,20 +132,22 @@ def run(job: dict) -> dict:
               "ok" if resp.ok else "denied",
               token_endpoint=token_ep, client_id=AGENT_NAME, client_certificate=info["spiffe_id"],
               subject_token="user access token (sub=%s)" % unverified_claims(job["user_token"]).get("sub"),
-              requested_scope=TASK_SCOPES, resource=resources, http_status=resp.status_code)
+              task_needs=TASK_SCOPES, requested_scope=request_scope, resource=resources,
+              http_status=resp.status_code)
     if not resp.ok:
-        trace.add(9, "Token exchange rejected", "PingFederate", "denied", **body)
+        trace.add(9, "Token exchange rejected", "PingFederate", "denied", policy_evaluation=evaluation, **body)
         return {**result, "steps": trace.steps, "error": body.get("error_description", "token exchange failed")}
 
     delegated = body["access_token"]
     claims = unverified_claims(delegated)
+    evaluation["granted_scopes"] = claims.get("scope", "")
     trace.add(9, "Delegated token issued: User ∩ Agent ∩ Requested", "PingFederate → AI Agent",
-              granted_scope=body.get("scope"), policy_evaluation=body.get("demo_policy_evaluation"),
-              claims=claims)
+              granted_scope=claims.get("scope"), policy_evaluation=evaluation, claims=claims)
     result["delegated_token"] = {"claims": claims, "jwt": delegated}
 
     # ---- 10: enterprise resources over mTLS with the bound token -----------------------
     session = requests.Session()
+    session.trust_env = False      # REQUESTS_CA_BUNDLE & co. would override the SPIFFE bundle
     session.cert = identity.client_cert
     session.verify = str(identity.bundle_path)
     session.headers["Authorization"] = f"Bearer {delegated}"

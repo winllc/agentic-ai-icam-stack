@@ -160,10 +160,14 @@ services:
       <<: *python-env
       HEALTH_PORT: "8090"
       AGENT_NAME: analysis-agent
+      AGENT_POLICY: /config/idp-policy.yaml
       SYSTEMS_API_URL: https://systems-api:8443
       OPS_MCP_URL: https://ops-mcp:8443/mcp
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-5-5}
+    volumes:
+      - spire-agent-socket:/run/spire/sockets:ro
+      - ./config/idp-policy.yaml:/config/idp-policy.yaml:ro
     healthcheck: *tcp-health
 
   remediation-agent:
@@ -175,10 +179,14 @@ services:
       <<: *python-env
       HEALTH_PORT: "8090"
       AGENT_NAME: remediation-agent
+      AGENT_POLICY: /config/idp-policy.yaml
       SYSTEMS_API_URL: https://systems-api:8443
       OPS_MCP_URL: https://ops-mcp:8443/mcp
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-5-5}
+    volumes:
+      - spire-agent-socket:/run/spire/sockets:ro
+      - ./config/idp-policy.yaml:/config/idp-policy.yaml:ro
     healthcheck: *tcp-health
 
   # ------------------------------------------------------------------ Enterprise resources

@@ -1,69 +1,112 @@
-# Overlay: swap the PingFederate-compatible simulator for a real PingFederate.
+# Overlay: run a real, licensed PingFederate instead of the simulator.
 #
-#   docker compose -f docker-compose.yml -f docker-compose.pingfederate.yml up -d
+#   cp ~/pingfederate.lic pingfederate/license/pingfederate.lic   # readable by uid 9031
+#   docker compose -f docker-compose.yml -f docker-compose.pingfederate.yml up -d --build --wait
 #
-# Requires Ping DevOps credentials (evaluation license) in .env, and PingFederate
-# configured as described in pingfederate/README.md. Not validated end-to-end by
-# the stack's automated checks (they run against the simulator).
+# pf-configurator applies config/idp-policy.yaml through the admin API (scopes, users,
+# OIDC + PKCE client, JWT access token managers, token exchange policy, mTLS agent
+# clients) and keeps SPIRE's CA bundle in PingFederate's Trusted CAs.
 
 x-real-pf-env: &real-pf-env
-  PF_ISSUER: ${PF_ISSUER:-https://localhost:9031}
+  PF_ISSUER: https://localhost:9031
   PF_INTERNAL_BASE: https://pingfederate:9031
   PF_DISCOVERY_URL: https://pingfederate:9031/.well-known/openid-configuration
-  PF_JWKS_URL: ${PF_JWKS_URL:-https://pingfederate:9031/pf/JWKS}
-  PF_TLS_CA: /pf-trust/pf-ca.pem            # PingFederate's runtime TLS cert / CA
-  REQUESTS_CA_BUNDLE: /pf-trust/pf-ca.pem
+  PF_JWKS_URL: https://pingfederate:9031/pf/JWKS
+  PF_TLS_CA: /pf-trust/pf-ca.pem          # written by pf-configurator
+
+x-after-configurator: &after-configurator
+  spire-agent:
+    condition: service_healthy
+  pf-configurator:
+    condition: service_healthy
 
 services:
   pingfederate:
-    image: pingidentity/pingfederate:${PF_IMAGE_TAG:-latest}
+    image: pingidentity/pingfederate:${PF_IMAGE_TAG:-2609-13.1.3}
     build: !reset null
     command: !reset null
     labels: !reset {}
     depends_on: !reset {}
-    healthcheck: !reset null
+    restart: unless-stopped
     environment: !override
       PING_IDENTITY_ACCEPT_EULA: "YES"
-      PING_IDENTITY_DEVOPS_USER: ${PING_IDENTITY_DEVOPS_USER:?set PING_IDENTITY_DEVOPS_USER in .env}
-      PING_IDENTITY_DEVOPS_KEY: ${PING_IDENTITY_DEVOPS_KEY:?set PING_IDENTITY_DEVOPS_KEY in .env}
-      SERVER_PROFILE_URL: ${PF_SERVER_PROFILE_URL:-}
-      SERVER_PROFILE_PATH: ${PF_SERVER_PROFILE_PATH:-}
+      PF_ENGINE_SECONDARY_PORT: "9032"        # mTLS listener for tls_client_auth
+      PF_ADMIN_PUBLIC_BASEURL: https://localhost:9999
     volumes: !override
-      # SPIRE trust bundle: import it as a trusted CA so PingFederate can
-      # authenticate agents by their X.509-SVIDs (tls_client_auth).
-      - spire-pki:/opt/spire-pki:ro
+      - ./pingfederate/license/pingfederate.lic:/opt/in/instance/server/default/conf/pingfederate.lic:ro
     ports: !override
-      - "9031:9031"   # runtime (HTTPS)
+      - "9031:9031"   # runtime (browser + back channel)
       - "9999:9999"   # admin console / admin API
+    healthcheck: !override
+      test: ["CMD-SHELL", "curl -skf https://localhost:9031/pf/heartbeat.ping >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+
+  pf-configurator:
+    image: agentic-icam/services:latest
+    command: ["python", "-m", "icam.pfconfig.configure"]
+    restart: unless-stopped
+    labels:
+      ai.demo.spiffe-workload: pf-configurator
+    depends_on:
+      spire-agent:
+        condition: service_healthy
+      pingfederate:
+        condition: service_healthy
+    environment:
+      SPIFFE_ENDPOINT_SOCKET: unix:///run/spire/sockets/agent.sock
+      PF_ADMIN_URL: https://pingfederate:9999
+      PF_ADMIN_USER: ${PF_ADMIN_USER:-administrator}
+      PF_ADMIN_PASSWORD: ${PF_ADMIN_PASSWORD:-2FederateM0re}
+      PF_ISSUER: https://localhost:9031
+      PF_POLICY: /config/idp-policy.yaml
+      PF_TRUST_DIR: /pf-trust
+      SYNC_INTERVAL: "30"
+    volumes:
+      - spire-agent-socket:/run/spire/sockets:ro
+      - ./config/idp-policy.yaml:/config/idp-policy.yaml:ro
+      - pf-trust:/pf-trust
+      - spire-pki:/pki:ro
+    healthcheck:
+      test: ["CMD", "test", "-f", "/pf-trust/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 120
+      start_period: 10s
 
   agentic-ai-service:
     environment:
       <<: *real-pf-env
-      OIDC_CLIENT_SECRET: ${PF_PORTAL_CLIENT_SECRET:-portal-secret}
     volumes: !override
-      - ./pingfederate/trust:/pf-trust:ro
+      - pf-trust:/pf-trust:ro
     depends_on: !override
-      pingfederate:
-        condition: service_started
+      <<: *after-configurator
 
   analysis-agent: &agent-overrides
     environment:
       <<: *real-pf-env
-      # PingFederate's mTLS listener (secondary HTTPS port) if not advertised via mtls_endpoint_aliases.
-      PF_MTLS_TOKEN_ENDPOINT: ${PF_MTLS_TOKEN_ENDPOINT:-}
-    volumes:
+      PF_MTLS_TOKEN_ENDPOINT: https://pingfederate:9032/as/token.oauth2
+    volumes: !override
       - spire-agent-socket:/run/spire/sockets:ro
-      - ./pingfederate/trust:/pf-trust:ro
+      - pf-trust:/pf-trust:ro
+      - ./config/idp-policy.yaml:/config/idp-policy.yaml:ro
+    depends_on: !override
+      <<: *after-configurator
 
   remediation-agent: *agent-overrides
 
   systems-api: &resource-overrides
     environment:
       <<: *real-pf-env
-      REQUIRE_CNF: ${PF_REQUIRE_CNF:-true}
-      REQUIRE_ACT: ${PF_REQUIRE_ACT:-true}
-    volumes:
+    volumes: !override
       - spire-agent-socket:/run/spire/sockets:ro
-      - ./pingfederate/trust:/pf-trust:ro
+      - pf-trust:/pf-trust:ro
+    depends_on: !override
+      <<: *after-configurator
 
   ops-mcp: *resource-overrides
+
+volumes:
+  pf-trust:

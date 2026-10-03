@@ -10,11 +10,14 @@ srv() { spire-server "$@" -socketPath "$SOCK"; }
 echo "[register] waiting for SPIRE Server"
 until srv healthcheck >/dev/null 2>&1; do sleep 1; done
 
-exists() { srv entry show -spiffeID "$1" 2>/dev/null | grep -q "Entry ID"; }
+# Capture first: `cmd | grep -q` under pipefail fails when grep exits early (SIGPIPE).
+exists() { local out; out=$(srv entry show -spiffeID "$1" 2>/dev/null || true); [[ "$out" == *"Entry ID"* ]]; }
+create() { local out; if out=$(srv entry create "$@" 2>&1); then echo "$out"; else
+  [[ "$out" == *AlreadyExists* ]] && echo "[register] already exists" || { echo "$out"; return 1; }; fi; }
 
 # Node alias: any agent whose x509pop node certificate has CN=docker-host.
 if ! exists "$NODE_ID"; then
-  srv entry create -node -spiffeID "$NODE_ID" -selector "x509pop:subject:cn:docker-host"
+  create -node -spiffeID "$NODE_ID" -selector "x509pop:subject:cn:docker-host"
 fi
 
 # Workloads: <spiffe path> <docker label value> <dns name>
@@ -26,7 +29,7 @@ while read -r path label dns; do
   if exists "$id"; then
     echo "[register] exists: $id"
   else
-    srv entry create -parentID "$NODE_ID" -spiffeID "$id" \
+    create -parentID "$NODE_ID" -spiffeID "$id" \
       -selector "docker:label:ai.demo.spiffe-workload:${label}" \
       -dns "$dns" -x509SVIDTTL 3600
   fi
@@ -36,6 +39,7 @@ agent/analysis-agent          analysis-agent      analysis-agent
 agent/remediation-agent       remediation-agent   remediation-agent
 resource/systems-api          systems-api         systems-api
 resource/ops-mcp              ops-mcp             ops-mcp
+ops/pf-configurator           pf-configurator     pf-configurator
 ENTRIES
 
 srv bundle show -format pem > /pki/spire-bundle.pem

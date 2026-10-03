@@ -113,8 +113,9 @@ class WorkloadIdentity:
         self._server_contexts.append(ctx)
         return ctx
 
-    def start_rotation(self, interval: int = 300) -> None:
-        """SVIDs are short-lived (1h); refresh them periodically for long-running servers."""
+    def start_rotation(self, interval: int = 30) -> None:
+        """Re-fetch periodically for long-running servers: SVIDs are short-lived (1h) and the
+        trust bundle changes when SPIRE rotates its CA - peers with new-CA SVIDs must be accepted."""
 
         def loop():
             while True:

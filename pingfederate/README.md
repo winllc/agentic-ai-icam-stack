@@ -1,62 +1,79 @@
-# Running against a real PingFederate
+# Running with a real PingFederate
 
-The default stack uses `services/icam/idp`, a small **PingFederate-compatible
-authorization server**. It serves PingFederate's endpoint paths
-(`/as/authorization.oauth2`, `/as/token.oauth2`, `/pf/JWKS`,
-`/idp/userinfo.openid`, `/idp/startSLO.ping`) and its policy comes from
-[`config/idp-policy.yaml`](../config/idp-policy.yaml). The simulator lets the demo
-run with no license. The other services rely only on standards (OIDC discovery,
-PKCE, RFC 8693, RFC 8705, RFC 8707), so they can point at a real PingFederate instead.
+`docker-compose.pingfederate.yml` replaces the simulator with **PingFederate 13.1**
+(`pingidentity/pingfederate:2609-13.1.3`). `pf-configurator` configures it completely
+through the admin API from [`config/idp-policy.yaml`](../config/idp-policy.yaml), the
+same file the simulator reads. Nothing is configured by hand.
 
-> **Status:** the overlay and the mapping below have **not** been run end to end
-> against a licensed PingFederate. The automated checks (`scripts/smoke_test.py`,
-> `scripts/security_checks.py`) run against the simulator. Admin console labels
-> vary between PingFederate versions, so treat this as a configuration checklist.
+Tested end to end on PingFederate 13.1.3 with a development license.
+`scripts/smoke_test.py` passes 4/4 and `scripts/security_checks.py` passes 9/9. A
+forced SPIRE CA rotation and a re-created PingFederate container both recover
+automatically.
 
-## 1. Start PingFederate
+## Start
 
 ```bash
-cp .env.example .env    # set PING_IDENTITY_DEVOPS_USER / PING_IDENTITY_DEVOPS_KEY
-docker compose -f docker-compose.yml -f docker-compose.pingfederate.yml up -d
-# admin console: https://localhost:9999/pingfederate/app  (Administrator / 2FederateM0re by default)
+cp /path/to/pingfederate.lic pingfederate/license/pingfederate.lic   # never committed (.gitignore)
+chmod 0644 pingfederate/license/pingfederate.lic                      # PingFederate runs as uid 9031
+docker compose -f docker-compose.yml -f docker-compose.pingfederate.yml up -d --build --wait
+python3 scripts/smoke_test.py && python3 scripts/security_checks.py
 ```
 
-To bring your own configuration, set `PF_SERVER_PROFILE_URL` and `PF_SERVER_PROFILE_PATH`
-to a server profile. Otherwise, configure the objects below in the admin console or
-through the admin API (`/pf-admin-api/v1`).
+- App: http://localhost:8080. PingFederate runtime: https://localhost:9031.
+  Admin console: https://localhost:9999/pingfederate/app (`administrator` / `2FederateM0re`;
+  override with `PF_ADMIN_PASSWORD`).
+- PingFederate's TLS certificate is issued by a **demo TLS CA** created by `pki-init`. To stop
+  browser warnings, trust that CA:
+  `docker compose cp pki-init:/pki/tls/demo-tls-ca.crt .` (or copy it out of the `spire-pki` volume).
+- Delete `-v` volumes with `docker compose -f docker-compose.yml -f docker-compose.pingfederate.yml down -v`.
 
-## 2. Trust in both directions
+## What `pf-configurator` creates
 
-| What | How |
+| Demo policy | PingFederate object |
 |---|---|
-| PingFederate trusts agent SVIDs | Import `/opt/spire-pki/spire-bundle.pem` (mounted into the container) under **Security → Trusted CAs**. SPIRE rotates its CA (`ca_ttl` 168h), so re-import the bundle after rotation or use federation. |
-| Services trust PingFederate's TLS cert | Export PingFederate's runtime server certificate (or its issuing CA) to `pingfederate/trust/pf-ca.pem`. The overlay mounts it and sets `PF_TLS_CA` / `REQUESTS_CA_BUNDLE`. Its SAN must include `pingfederate` and `localhost`. |
-| mTLS listener | Enable the secondary HTTPS port for client-certificate authentication (`pf.secondary.https.port`). Advertise it as `mtls_endpoint_aliases.token_endpoint`, or set `PF_MTLS_TOKEN_ENDPOINT=https://pingfederate:<port>/as/token.oauth2` in `.env`. |
-| Base URL | **System → Server Settings → Federation Info**: base URL `https://localhost:9031`. It must equal `PF_ISSUER`. |
+| first start | accepts the license agreement, creates the initial administrator |
+| `scopes` | OAuth common scopes. `disallowPlainPKCE` is set. |
+| `users` | Simple Username/Password Credential Validator → HTML Form IdP Adapter → IdP adapter grant mapping |
+| user `entitlements` | `entitlements` claim in the user access token (OGNL lookup keyed by `USER_KEY`) |
+| user access token | JWT ATM `useratm`: RS256 with the central signing key (`/pf/JWKS`), `iss=https://localhost:9031`, `aud=agentic-ai-service` |
+| ID token | OIDC policy `portaloidc` (`sub`, `name`, `email`, `groups`) |
+| `agentic-ai-portal` | Authorization Code, **PKCE required**, client secret, restricted scopes |
+| subject-token validation | OAuth Bearer Access Token processor `userat` (validates against `useratm`) |
+| token exchange | processor policy `agentdelegation`. Requires a subject token from `agentic-ai-portal` with `aud=agentic-ai-service`. |
+| `analysis-agent`, `remediation-agent` | client auth **CERTIFICATE**: subject DN `CN=<agent>, O=SPIRE, C=US` (stable in SPIRE SVIDs), issuer DN = current SPIRE CA. Grant type Token Exchange; **restricted scopes = agent ceiling**. |
+| delegated token | JWT ATM `delegatedatm` (5 min) with resource URIs. Mapping from the policy (OGNL over `context.HttpRequest`) adds:<br>`act = {"sub": "spiffe://demo.local/agent/<client>"}`<br>`cnf = {"x5t#S256": SHA-256 of the client's mTLS certificate}`<br>`aud = requested resource(s)` |
+| User ∩ Agent ∩ Requested | **Agent:** PingFederate rejects scopes outside the client's restricted scopes (`invalid_scope`).<br>**User:** an issuance criterion rejects any requested scope not in the subject token's `entitlements` and `scope`.<br>**Resources:** a second criterion allows only the registered resource servers. |
+| runtime TLS | `runtime-tls` key pair imported from `pki-init` (SAN `pingfederate`, `localhost`) |
+| mTLS listener | `PF_ENGINE_SECONDARY_PORT=9032`: agents call `https://pingfederate:9032/as/token.oauth2` |
+| SPIRE trust | every SPIRE X.509 authority imported into **Trusted CAs** |
 
-## 3. Objects to create
+After the initial run the configurator keeps running. Every 30 seconds it:
+- imports new SPIRE CAs and updates the agent clients' issuer DN after a rotation (SPIRE puts a
+  random `serialNumber` in each CA subject, and PingFederate matches the issuer DN exactly);
+- re-applies everything if PingFederate comes back empty, for example after the container is re-created;
+- exits after repeated failures, so Docker restarts it and it re-pins the admin certificate.
 
-| Demo policy (`idp-policy.yaml`) | PingFederate object |
-|---|---|
-| `scopes` | **OAuth Server → Scope Management**: `systems:read`, `systems:analyze`, `metrics:read`, `tickets:read`, `tickets:write` |
-| `users` + `entitlements` | Password Credential Validator (Simple Username/Password, or LDAP in real life) + HTML Form IdP Adapter. Expose an `entitlements` attribute and use it to limit granted scopes, for example with an access-token-mapping OGNL issuance criterion or a policy that drops scopes the user isn't entitled to. |
-| User access token | **JWT Access Token Manager**: RS256, publish keys at a JWKS endpoint, `aud = agentic-ai-service`. Map `sub`, `client_id`, `scope`, `name`, `groups`. If its JWKS URL is not `/pf/JWKS`, set `PF_JWKS_URL` in `.env`. |
-| Client `agentic-ai-portal` | Authorization Code, **Require PKCE** (S256), client secret, redirect URI `http://localhost:8080/callback`, OIDC policy issuing the ID token (`name`, `email`, `groups`). |
-| Clients `analysis-agent`, `remediation-agent` | Client authentication **Client TLS Certificate**, matched on the certificate's SAN URI `spiffe://demo.local/agent/<name>` (versions that only match Subject DN need the DN SPIRE puts in the SVID instead). Grant type **Token Exchange**. **Restrict scopes** to the agent ceiling: analysis gets `systems:read systems:analyze metrics:read tickets:read`; remediation gets `systems:read tickets:read tickets:write`. Allowed resources: `https://systems-api:8443`, `https://ops-mcp:8443/mcp`. |
-| Delegation (User ∩ Agent ∩ Requested) | **Token Exchange Processor Policy** accepting `urn:ietf:params:oauth:token-type:access_token` subject tokens from the JWT ATM above. Map `sub` from the subject token. Add an `act` claim `{ "sub": <client SPIFFE ID> }`. Restrict scopes so that `requested ∩ client-allowed ∩ subject-token scope` holds. Client restriction covers the first two; the subject-token part needs an OGNL issuance criterion on the token-exchange access token mapping. |
-| Delegated token | JWT ATM for the resources: `aud` = requested resource(s), short lifetime (5 min), certificate-bound (`cnf.x5t#S256`) when the client authenticated with mTLS. |
+The admin API is reached over a TLS connection **pinned to the certificate first seen**.
+The admin console's certificate is self-signed, so chain validation isn't possible. The
+pin is enforced on every connection instead of disabling verification.
 
-If your PingFederate version cannot emit `cnf` or `act` on exchanged tokens, the
-resource servers can relax those checks: set `PF_REQUIRE_CNF=false` and/or
-`PF_REQUIRE_ACT=false` in `.env`. Doing so drops the sender-constraint and
-actor-identity guarantees that `scripts/security_checks.py` demonstrates.
+## Behavior differences vs. the simulator
 
-## 4. Verify
+- PingFederate never narrows scope: a request outside User ∩ Agent is **rejected**. The
+  simulator does the same, so in both modes the agent requests `task ∩ its ceiling ∩ the user's scopes`.
+  The agent reads its ceiling from its own client entry in `config/idp-policy.yaml`.
+- PingFederate doesn't advertise RFC 8705 `mtls_endpoint_aliases`, so agents get the mTLS
+  endpoint from `PF_MTLS_TOKEN_ENDPOINT`.
+- The user access token carries every portal scope the user requested. Per-user limits travel
+  in its `entitlements` claim, and token exchange enforces them.
+- Logout goes through PingFederate's `/idp/init_logout.openid` (OIDC RP-initiated logout),
+  which shows a confirmation page.
 
-```bash
-python3 scripts/smoke_test.py        # expects the same scope intersections as the simulator
-```
+## Notes for production
 
-`demo_policy_evaluation` is an explanation field only the simulator returns. With
-real PingFederate, step 9 in the UI shows the granted scope and claims, but not the
-per-scope reasons.
+- `entitlements` come from a static OGNL map built from the YAML. In production, use an LDAP
+  or JDBC data store, or PingDirectory, as the attribute source.
+- The `act`/`cnf`/`aud` OGNL reads the token-exchange request directly. Review it against your
+  PingFederate version, and keep the expression administrator role restricted.
+- In production, replace the label-only SPIRE selectors with image digests or Kubernetes
+  attestation, and federate the trust bundle instead of copying CAs.

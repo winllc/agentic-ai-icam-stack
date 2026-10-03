@@ -29,6 +29,31 @@ EXT
   rm -f node-agent.csr node-agent.ext
 fi
 
+# Demo TLS CA + server certificate for a real PingFederate (docker-compose.pingfederate.yml).
+# Stable across PingFederate re-creation, and importable into a browser to avoid warnings.
+mkdir -p tls
+if [[ ! -f tls/demo-tls-ca.crt ]]; then
+  echo "[pki-init] creating demo TLS CA and PingFederate server certificate"
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout tls/demo-tls-ca.key -out tls/demo-tls-ca.crt -days 3650 \
+    -subj "/O=Agentic AI ICAM Demo/CN=Demo TLS CA" \
+    -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign"
+  openssl req -newkey rsa:2048 -nodes -keyout tls/pingfederate.key -out tls/pingfederate.csr \
+    -subj "/O=Agentic AI ICAM Demo/CN=pingfederate"
+  cat > tls/pingfederate.ext <<EXT
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:pingfederate,DNS:localhost
+EXT
+  openssl x509 -req -in tls/pingfederate.csr -CA tls/demo-tls-ca.crt -CAkey tls/demo-tls-ca.key -CAcreateserial \
+    -out tls/pingfederate.crt -days 825 -extfile tls/pingfederate.ext
+  openssl pkcs12 -export -in tls/pingfederate.crt -inkey tls/pingfederate.key -certfile tls/demo-tls-ca.crt \
+    -name runtime-tls -out tls/pingfederate.p12 -passout pass:"${PF_TLS_P12_PASSWORD:-changeit}"
+  rm -f tls/pingfederate.csr tls/pingfederate.ext
+fi
+chmod 0644 tls/demo-tls-ca.crt tls/pingfederate.crt tls/pingfederate.p12
+chmod 0600 tls/demo-tls-ca.key tls/pingfederate.key
+
 # spire-server runs as uid 1000 in the upstream image.
 chmod 0644 node-ca.crt node-agent.crt
 chmod 0600 node-ca.key node-agent.key
