@@ -4,6 +4,7 @@ SYSTEMS = {
     "payments-api": {
         "name": "Payments API", "owner": "payments-team", "tier": "tier-1", "env": "prod",
         "status": "degraded", "version": "4.12.3", "region": "us-east-1",
+        "vendor": {"partner": "partner.example", "service": "fraud-scoring", "api": "https://partner-api:8443"},
         "metrics": {"cpu_pct": 71, "mem_pct": 64, "p99_latency_ms": 1840, "error_rate_pct": 4.2, "rps": 1250},
         "diagnostics": [
             {"check": "upstream:fraud-scoring", "result": "timeout rate 11% (threshold 2%)", "severity": "high"},
@@ -14,6 +15,7 @@ SYSTEMS = {
     "erp-db": {
         "name": "ERP Database", "owner": "data-platform", "tier": "tier-1", "env": "prod",
         "status": "healthy", "version": "PostgreSQL 16.4", "region": "us-east-1",
+        "vendor": {"partner": "partner.example", "service": "backup-vault", "api": "https://partner-api:8443"},
         "metrics": {"cpu_pct": 38, "mem_pct": 71, "p99_latency_ms": 22, "error_rate_pct": 0.0, "rps": 640},
         "diagnostics": [
             {"check": "replication-lag", "result": "0.4s", "severity": "ok"},
@@ -24,6 +26,7 @@ SYSTEMS = {
     "hr-portal": {
         "name": "HR Portal", "owner": "people-tech", "tier": "tier-2", "env": "prod",
         "status": "healthy", "version": "2.3.0", "region": "eu-west-1",
+        "vendor": {"partner": "partner.example", "service": "payroll-gateway", "api": "https://partner-api:8443"},
         "metrics": {"cpu_pct": 12, "mem_pct": 33, "p99_latency_ms": 310, "error_rate_pct": 0.3, "rps": 40},
         "diagnostics": [
             {"check": "dependency-scan", "result": "1 critical CVE in log4j-core 2.14.1", "severity": "critical"},

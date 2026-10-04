@@ -24,11 +24,19 @@ class TokenError(Exception):
 
 
 class JwtValidator:
-    def __init__(self, jwks_url: str, issuer: str):
+    def __init__(self, jwks_url: str, issuer: str, tls_ca: str | None = None):
         self.issuer = issuer
-        ca = os.environ.get("PF_TLS_CA")  # trust a real PingFederate's TLS cert for the JWKS fetch
-        ctx = ssl.create_default_context(cafile=ca) if ca else None
-        self.jwks = jwt.PyJWKClient(jwks_url, cache_keys=True, lifespan=300, ssl_context=ctx)
+        self.jwks_url = jwks_url
+        # CA for an HTTPS JWKS endpoint (a real PingFederate, or a SPIFFE bundle file).
+        self.tls_ca = tls_ca or os.environ.get("PF_TLS_CA")
+        self._jwks = None
+
+    @property
+    def jwks(self) -> jwt.PyJWKClient:
+        if self._jwks is None:   # lazy: the CA file may only exist once the service is up
+            ctx = ssl.create_default_context(cafile=self.tls_ca) if self.tls_ca else None
+            self._jwks = jwt.PyJWKClient(self.jwks_url, cache_keys=True, lifespan=300, ssl_context=ctx)
+        return self._jwks
 
     def validate(self, token: str, audience: str) -> dict:
         try:

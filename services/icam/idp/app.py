@@ -36,6 +36,7 @@ from werkzeug.serving import make_server
 
 from icam.common import logs
 from icam.common.spiffe_identity import WorkloadIdentity, peer_cert_from_environ, spiffe_ids, x5t_s256
+from icam.common.federation import TT_JWT, pairwise_subject
 from icam.common.tokens import scopes_of
 
 log = logs.setup("pingfederate-sim")
@@ -297,6 +298,16 @@ def grant_token_exchange():
     if bad:
         return oauth_error("invalid_target", f"agent may not obtain tokens for {bad}")
 
+    # --- 3b. Identity chaining: a grant for a partner's AS is minted separately from
+    # internal tokens and may only carry that partner's egress scopes.
+    partners = {f["authorization_server"]: (td, f) for td, f in POLICY.get("federation", {}).items()}
+    partner = partners.get(resources[0])
+    if partner and len(resources) > 1:
+        return oauth_error("invalid_target", "a federation grant is addressed to exactly one partner AS")
+    if not partner and any(r in partners for r in resources):
+        return oauth_error("invalid_target", "partner AS cannot be mixed with internal resources")
+    egress_scopes = {s for _, f in partners.values() for s in f["scopes"]}
+
     # --- 4. Scope: User ∩ Agent ∩ Requested.
     user_scopes = scopes_of(subject) - {"openid", "profile", "email"}
     if "entitlements" in subject:
@@ -317,9 +328,16 @@ def grant_token_exchange():
         return oauth_error("invalid_scope", "requested scope must be within user ∩ agent: "
                            + ", ".join(f"{s} ({why})" for s, why in evaluation["denied"].items()) or "empty")
 
+    if partner and not requested <= set(partner[1]["scopes"]):
+        return oauth_error("invalid_scope", f"only {partner[1]['scopes']} may leave for {partner[0]}")
+    if not partner and requested & egress_scopes:
+        return oauth_error("invalid_scope", "egress scopes are only issued inside a federation grant")
+
     now = int(time.time())
-    ttl = client.get("access_token_ttl", 300)
     spiffe_id = client["tls_client_auth_san_uri"]
+    if partner:
+        return federation_grant(subject, client_id, spiffe_id, cert, granted, partner, evaluation, now)
+    ttl = client.get("access_token_ttl", 300)
     delegated = sign({
         "iss": ISSUER, "sub": subject["sub"], "aud": resources if len(resources) > 1 else resources[0],
         "client_id": client_id, "scope": ordered(granted), "iat": now, "exp": min(now + ttl, subject["exp"]),
@@ -331,6 +349,27 @@ def grant_token_exchange():
     record("token_exchange", user=subject["sub"], agent=client_id, actor=spiffe_id,
            granted=ordered(granted), resources=resources)
     body = {"access_token": delegated, "issued_token_type": TT_ACCESS, "token_type": "Bearer",
+            "expires_in": ttl, "scope": ordered(granted)}
+    if EXPLAIN:
+        body["demo_policy_evaluation"] = evaluation
+    return jsonify(body)
+
+
+def federation_grant(subject, client_id, spiffe_id, cert, granted, partner, evaluation, now):
+    """JWT authorization grant for a partner AS (identity chaining across domains)."""
+    trust_domain, fed = partner
+    ttl = fed.get("grant_ttl", 60)
+    sub = (pairwise_subject(subject["sub"], trust_domain, fed["pairwise_salt"])
+           if fed.get("subject") == "pairwise" else subject["sub"])
+    grant = sign({
+        "iss": ISSUER, "sub": sub, "aud": fed["authorization_server"], "client_id": client_id,
+        "scope": ordered(granted), "iat": now, "exp": min(now + ttl, subject["exp"]), "jti": uuid.uuid4().hex,
+        "act": {"sub": spiffe_id, "client_id": client_id},
+        "cnf": {"x5t#S256": x5t_s256(cert)},   # only this agent can redeem it at the partner
+    })
+    record("federation_grant", user=subject["sub"], pairwise_sub=sub, agent=client_id, partner=trust_domain,
+           granted=ordered(granted))
+    body = {"access_token": grant, "issued_token_type": TT_JWT, "token_type": "N_A",
             "expires_in": ttl, "scope": ordered(granted)}
     if EXPLAIN:
         body["demo_policy_evaluation"] = evaluation

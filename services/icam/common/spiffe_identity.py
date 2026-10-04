@@ -67,7 +67,8 @@ class WorkloadIdentity:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.cert_path = self.dir / "svid.pem"
         self.key_path = self.dir / "svid.key"
-        self.bundle_path = self.dir / "bundle.pem"
+        self.bundle_path = self.dir / "bundle.pem"              # own trust domain only
+        self.federated_bundle_path = self.dir / "bundles-all.pem"  # own + federated trust domains
         self.info: dict | None = None
         self._server_contexts: list[ssl.SSLContext] = []
         self._lock = threading.Lock()
@@ -82,12 +83,16 @@ class WorkloadIdentity:
             svid.save(self.cert_path, self.key_path, Encoding.PEM)
             os.chmod(self.key_path, 0o600)
             bundle.save(self.bundle_path, Encoding.PEM)
+            authorities = [a for b in ctx.x509_bundle_set.bundles for a in b.x509_authorities]
+            self.federated_bundle_path.write_bytes(b"".join(a.public_bytes(Encoding.PEM) for a in authorities))
             self.info = describe_cert(svid.leaf)
             self.info["trust_domain"] = str(svid.spiffe_id.trust_domain)
             self.info["bundle_authorities"] = len(bundle.x509_authorities)
-            for c in self._server_contexts:
+            self.info["federated_trust_domains"] = sorted(
+                str(b.trust_domain) for b in ctx.x509_bundle_set.bundles if b.trust_domain != bundle.trust_domain)
+            for c, federated in self._server_contexts:
                 c.load_cert_chain(self.cert_path, self.key_path)
-                c.load_verify_locations(cafile=str(self.bundle_path))
+                c.load_verify_locations(cafile=str(self.federated_bundle_path if federated else self.bundle_path))
         return self.info
 
     def wait_for_svid(self, attempts: int = 60, delay: float = 2.0) -> dict:
@@ -103,14 +108,15 @@ class WorkloadIdentity:
                 time.sleep(delay)
         raise RuntimeError(f"could not obtain an X.509-SVID from {self.socket_path}: {last}")
 
-    def server_context(self, require_client_cert: bool = True) -> ssl.SSLContext:
-        """TLS server context presenting our SVID and verifying peers against the SPIFFE bundle."""
+    def server_context(self, require_client_cert: bool = True, trust_federated: bool = False) -> ssl.SSLContext:
+        """TLS server context presenting our SVID and verifying peers against the SPIFFE bundle
+        (plus federated trust domains' bundles when trust_federated is set)."""
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ctx.load_cert_chain(self.cert_path, self.key_path)
-        ctx.load_verify_locations(cafile=str(self.bundle_path))
+        ctx.load_verify_locations(cafile=str(self.federated_bundle_path if trust_federated else self.bundle_path))
         ctx.verify_mode = ssl.CERT_REQUIRED if require_client_cert else ssl.CERT_OPTIONAL
-        self._server_contexts.append(ctx)
+        self._server_contexts.append((ctx, trust_federated))
         return ctx
 
     def start_rotation(self, interval: int = 30) -> None:

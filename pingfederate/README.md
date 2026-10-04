@@ -6,7 +6,8 @@ through the admin API from [`config/idp-policy.yaml`](../config/idp-policy.yaml)
 same file the simulator reads. Nothing is configured by hand.
 
 Tested end to end on PingFederate 13.1.3 with a development license.
-`scripts/smoke_test.py` passes 4/4 and `scripts/security_checks.py` passes 9/9. A
+`scripts/smoke_test.py` passes 4/4 (steps 1–14, including the cross-domain call to
+`partner.example`) and `scripts/security_checks.py` passes 16/16. A
 forced SPIRE CA rotation and a re-created PingFederate container both recover
 automatically.
 
@@ -43,6 +44,7 @@ python3 scripts/smoke_test.py && python3 scripts/security_checks.py
 | `analysis-agent`, `remediation-agent` | client auth **CERTIFICATE**: subject DN `CN=<agent>, O=SPIRE, C=US` (stable in SPIRE SVIDs), issuer DN = current SPIRE CA. Grant type Token Exchange; **restricted scopes = agent ceiling**. |
 | delegated token | JWT ATM `delegatedatm` (5 min) with resource URIs. Mapping from the policy (OGNL over `context.HttpRequest`) adds:<br>`act = {"sub": "spiffe://demo.local/agent/<client>"}`<br>`cnf = {"x5t#S256": SHA-256 of the client's mTLS certificate}`<br>`aud = requested resource(s)` |
 | User ∩ Agent ∩ Requested | **Agent:** PingFederate rejects scopes outside the client's restricted scopes (`invalid_scope`).<br>**User:** an issuance criterion rejects any requested scope not in the subject token's `entitlements` and `scope`.<br>**Resources:** a second criterion allows only the registered resource servers. |
+| federation grant (steps 11–12) | JWT ATM `fedgrantpartnerexample` (1 min), selected by `resource = https://partner-as:8443`, from the same processor policy. The mapping computes a **pairwise `sub`** (SHA-256 of user, trust domain and salt in OGNL, identical to the simulator) and adds `act`, `cnf` and `aud`. Criteria: User bound, exactly the partner AS as resource, only that partner's egress scopes. Agent clients aren't restricted to the default ATM, so `resource` can select it. The internal mapping rejects egress scopes. |
 | runtime TLS | `runtime-tls` key pair imported from `pki-init` (SAN `pingfederate`, `localhost`) |
 | mTLS listener | `PF_ENGINE_SECONDARY_PORT=9032`: agents call `https://pingfederate:9032/as/token.oauth2` |
 | SPIRE trust | every SPIRE X.509 authority imported into **Trusted CAs** |
@@ -66,6 +68,9 @@ pin is enforced on every connection instead of disabling verification.
   endpoint from `PF_MTLS_TOKEN_ENDPOINT`.
 - The user access token carries every portal scope the user requested. Per-user limits travel
   in its `entitlements` claim, and token exchange enforces them.
+- For the federation grant the agent sends no `requested_token_type`. PingFederate only issues
+  `urn:ietf:params:oauth:token-type:jwt` through token-generator plugins, so it would reject
+  that type. The grant comes from the federation-grant ATM, which already issues a signed JWT.
 - Logout goes through PingFederate's `/idp/init_logout.openid` (OIDC RP-initiated logout),
   which shows a confirmation page.
 

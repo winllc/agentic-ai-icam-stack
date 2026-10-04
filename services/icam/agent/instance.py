@@ -5,6 +5,9 @@ Reads the task (incl. the user's access token) from stdin, then:
   8-9  exchanges the user's token for a delegated, certificate-bound token at
        PingFederate, authenticating with mTLS using the SVID
   10   calls enterprise resources (REST API + MCP server) over mTLS
+  11-14 calls an EXTERNAL partner's API across domains (identity chaining): exchanges the
+       user's token for a JWT authorization grant addressed to the partner's AS, redeems it
+       there with mTLS (SPIFFE federation), and calls the partner API with the partner's token
 and prints a JSON trace of every step on stdout.
 """
 
@@ -17,6 +20,7 @@ import time
 
 import requests
 
+from icam.common.federation import JWT_BEARER
 from icam.common.spiffe_identity import WorkloadIdentity
 from icam.common.tokens import unverified_claims
 
@@ -34,6 +38,8 @@ OPS_MCP = os.environ.get("OPS_MCP_URL", "https://ops-mcp:8443/mcp")
 TASK_SCOPES = os.environ.get("TASK_SCOPES",
                              "systems:read systems:analyze metrics:read tickets:read tickets:write")
 AGENT_POLICY = os.environ.get("AGENT_POLICY", "/config/idp-policy.yaml")
+# What the task may need from the external partner (only ever sent inside a federation grant).
+EGRESS_SCOPES = os.environ.get("EGRESS_SCOPES", "partner:status.read partner:cases.write")
 
 
 def agent_ceiling() -> set[str]:
@@ -52,7 +58,7 @@ def user_scopes(claims: dict) -> set[str]:
 
 
 def ordered(scopes) -> str:
-    order = TASK_SCOPES.split()
+    order = TASK_SCOPES.split() + EGRESS_SCOPES.split()
     return " ".join(sorted(scopes, key=lambda s: order.index(s) if s in order else 99))
 TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
 TT_ACCESS = "urn:ietf:params:oauth:token-type:access_token"
@@ -205,11 +211,108 @@ def run(job: dict) -> dict:
               "partial" if denied else "ok", calls=calls,
               note="Each call: mTLS with the SVID + bearer token bound to that SVID (cnf.x5t#S256).")
 
+    federate(trace, identity, job, token_ep, data, findings, user_set, agent_set)
+
     result["data"] = data
     result["findings"] = findings
     result["summary"] = summarize(job["task"], system, data, findings, calls)
     result["steps"] = trace.steps
     return result
+
+
+def federate(trace, identity, job, token_ep, data, findings, user_set, agent_set):
+    """Steps 11-14: call the vendor this system depends on, in the partner's trust domain."""
+    vendor = (data.get("system") or {}).get("vendor")
+    if not vendor:
+        trace.add(11, "No external dependency to check", "AI Agent", "skipped",
+                  note="the system record (systems:read) names no partner service")
+        return
+    api = vendor["api"]
+    needs = {"partner:status.read"} | ({"partner:cases.write"} if findings["severity"] in ("high", "critical") else set())
+    egress = needs & agent_set & user_set
+    evaluation = {"user_scopes": ordered(user_set & set(EGRESS_SCOPES.split())),
+                  "agent_scopes": ordered(agent_set & set(EGRESS_SCOPES.split())),
+                  "requested_scopes": ordered(needs),
+                  "denied": {s: ("not entitled (user)" if s not in user_set else "not allowed for agent")
+                             for s in sorted(needs - egress)}}
+    if not egress:
+        trace.add(11, "Nothing may leave the domain", "AI Agent", "denied", policy_evaluation=evaluation)
+        return
+
+    # Discover the partner's AS from the API itself (RFC 9728 protected resource metadata),
+    # trusting the federated partner.example bundle for TLS.
+    partner = requests.Session()
+    partner.trust_env = False
+    partner.cert = identity.client_cert
+    partner.verify = str(identity.federated_bundle_path)
+    prm = partner.get(f"{api}/.well-known/oauth-protected-resource", timeout=10).json()
+    partner_as = prm["authorization_servers"][0]
+    as_meta = partner.get(f"{partner_as}/.well-known/oauth-authorization-server", timeout=10).json()
+
+    # ---- 11: our AS mints a JWT authorization grant addressed to the partner AS
+    resp = requests.post(token_ep, cert=identity.client_cert, verify=PF_TLS_CA or str(identity.bundle_path),
+                         timeout=15, data={
+                             "grant_type": TOKEN_EXCHANGE, "client_id": AGENT_NAME,
+                             "subject_token": job["user_token"], "subject_token_type": TT_ACCESS,
+                             # No requested_token_type: PingFederate selects the federation-grant
+                             # token manager (a signed JWT) by `resource`; it would only honour
+                             # "...:jwt" through a token-generator plugin.
+                             "scope": ordered(egress), "resource": as_meta["issuer"]})
+    body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+    trace.add(11, "Token Exchange for a cross-domain JWT authorization grant (identity chaining)",
+              "AI Agent → PingFederate", "ok" if resp.ok else "denied",
+              discovered={"protected_resource": prm["resource"], "authorization_server": partner_as},
+              requested_scope=ordered(egress), resource=as_meta["issuer"],
+              http_status=resp.status_code)
+    if not resp.ok:
+        trace.add(12, "Federation grant rejected", "PingFederate", "denied", policy_evaluation=evaluation, **body)
+        return
+    grant = body["access_token"]
+    grant_claims = unverified_claims(grant)
+    evaluation["granted_scopes"] = grant_claims.get("scope", "")
+    trace.add(12, "JWT grant issued for partner.example (pairwise subject, 60 s, bound to the SVID)",
+              "PingFederate → AI Agent", policy_evaluation=evaluation, claims=grant_claims)
+
+    # ---- 13: redeem the grant at the partner AS (RFC 7523), mTLS with the SVID (SPIFFE federation)
+    r = partner.post(as_meta["token_endpoint"], timeout=15, data={
+        "grant_type": JWT_BEARER, "assertion": grant, "scope": ordered(egress), "resource": prm["resource"]})
+    tok = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+    claims = unverified_claims(tok.get("access_token", "")) if r.ok else {}
+    pp = tok.get("partner_policy", {})
+    trace.add(13, "Partner AS redeems the grant (jwt-bearer) and issues its own token", "AI Agent → Partner AS",
+              "ok" if r.ok else "denied", token_endpoint=as_meta["token_endpoint"], http_status=r.status_code,
+              policy_evaluation={"user_scopes": " ".join(pp.get("grant", [])),
+                                 "agent_scopes": " ".join(pp.get("client_ceiling", [])),
+                                 "requested_scopes": " ".join(pp.get("requested", [])),
+                                 "granted_scopes": tok.get("scope", ""),
+                                 "labels": ["Grant (from demo.local)", "Partner's client ceiling", "Requested"]}
+              if r.ok else None, claims=claims, **({} if r.ok else tok))
+    if not r.ok:
+        return
+
+    # ---- 14: call the partner API with the partner-issued token
+    partner.headers["Authorization"] = f"Bearer {tok['access_token']}"
+    calls = []
+
+    def call(method, path, scope, key, **kw):
+        resp = partner.request(method, f"{api}{path}", timeout=10, **kw)
+        calls.append({"kind": "REST", "operation": f"{method} {path}", "scope": scope, "http_status": resp.status_code,
+                      "outcome": "allowed" if resp.ok else (resp.headers.get("WWW-Authenticate") or resp.text[:200])})
+        if resp.ok:
+            data[key] = resp.json()
+
+    call("GET", f"/v1/services/{vendor['service']}/status", "partner:status.read", "partner_status")
+    status = (data.get("partner_status") or {}).get("status")
+    if findings["severity"] in ("high", "critical") and status and status != "operational":
+        call("POST", "/v1/support-cases", "partner:cases.write", "partner_case",
+             json={"service": vendor["service"], "summary": f"{findings['headline']} - correlates with {status} status"})
+    if status and status != "operational":
+        findings["issues"].append(f"partner {vendor['partner']} reports {vendor['service']} {status}: "
+                                  f"{data['partner_status'].get('incident')}")
+    denied = [c for c in calls if c["http_status"] in (401, 403)]
+    trace.add(14, f"External API calls to {vendor['partner']}", "AI Agent → Partner API",
+              "partial" if denied else "ok", calls=calls,
+              note="mTLS across trust domains (SPIFFE federation) + partner token bound to the same SVID.")
 
 
 def analyze(system: str, data: dict) -> dict:
@@ -245,6 +348,8 @@ def summarize(task: str, system: str, data: dict, findings: dict, calls: list) -
         lines.append(f"Opened ticket {data['ticket']['id']}.")
     elif findings["severity"] in ("high", "critical"):
         lines.append("Wanted to open a ticket but the delegated token lacks tickets:write.")
+    if "partner_case" in data:
+        lines.append(f"Opened support case {data['partner_case']['case']['id']} with the partner.")
     summary = {"engine": "rules", "text": "\n".join(lines)}
 
     if not os.environ.get("ANTHROPIC_API_KEY"):

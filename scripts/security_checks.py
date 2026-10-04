@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Negative tests against the running stack (simulator or real PingFederate) - each one
-is an attack or policy violation the design must stop.
+is an attack or policy violation the design must stop, inside demo.local and across the
+federation boundary to partner.example.
 
     pip install requests && python3 scripts/security_checks.py
 """
@@ -79,6 +80,38 @@ except Exception as exc:
 """
 
 
+FEDERATE = """
+me = WorkloadIdentity(); me.fetch()
+TE, AT = 'urn:ietf:params:oauth:grant-type:token-exchange', 'urn:ietf:params:oauth:token-type:access_token'
+r = requests.post(args['token_ep'], cert=me.client_cert, verify=args.get('ca') or str(me.bundle_path), data={
+    'grant_type': TE, 'client_id': args['client_id'], 'subject_token': args['user_token'],
+    'subject_token_type': AT, 'scope': 'partner:status.read',
+    'resource': 'https://partner-as:8443'})
+out = {'grant': r.json().get('access_token'), 'grant_status': r.status_code}
+if args.get('redeem') and out['grant']:
+    p = requests.post('https://partner-as:8443/token', cert=me.client_cert, verify=str(me.federated_bundle_path),
+                      data={'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion': out['grant'],
+                            'scope': 'partner:status.read', 'resource': 'https://partner-api:8443'})
+    out['partner_token'] = p.json().get('access_token'); out['partner_status'] = p.status_code
+print(json.dumps(out))
+"""
+
+REDEEM = """
+me = WorkloadIdentity(); me.fetch()
+r = requests.post('https://partner-as:8443/token', cert=me.client_cert, verify=str(me.federated_bundle_path),
+                  data={'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion': args['assertion'],
+                        'scope': 'partner:status.read'})
+print(json.dumps({'status': r.status_code, 'body': r.text[:300]}))
+"""
+
+PARTNER_CALL = """
+me = WorkloadIdentity(); me.fetch()
+r = requests.get('https://partner-api:8443/v1/services/fraud-scoring/status', cert=me.client_cert,
+                 verify=str(me.federated_bundle_path), headers={'Authorization': 'Bearer ' + args['token']})
+print(json.dumps({'status': r.status_code, 'www': r.headers.get('WWW-Authenticate'), 'body': r.text[:200]}))
+"""
+
+
 def exchange(service: str, **form) -> dict:
     return in_container(service, CALL_WITH_OWN_SVID, method="POST", url=stack.mtls_token_endpoint,
                         ca=stack.container_ca, data=form)
@@ -86,8 +119,10 @@ def exchange(service: str, **form) -> dict:
 
 def main() -> int:
     print(f"identity provider: {stack.name}\n")
-    alice = user_access_token("alice", "openid systems:read systems:analyze metrics:read tickets:read tickets:write")
-    bob = user_access_token("bob", "openid systems:read systems:analyze metrics:read tickets:read tickets:write")
+    all_scopes = ("openid systems:read systems:analyze metrics:read tickets:read tickets:write "
+                  "partner:status.read partner:cases.write")
+    alice = user_access_token("alice", all_scopes)
+    bob = user_access_token("bob", all_scopes)
     stolen = delegated_token_via_portal("alice", "analysis-agent")
     te = {"grant_type": TE, "subject_token": alice, "subject_token_type": AT, "scope": "systems:read",
           "resource": RESOURCES}
@@ -127,6 +162,49 @@ def main() -> int:
     # 8. Re-delegation: exchange a delegated token again to widen/extend it.
     out = exchange("analysis-agent", **{**te, "subject_token": stolen, "client_id": "analysis-agent"})
     checks.append(("Re-delegation of a delegated token", out.get("status") in (400, 401), out))
+
+    # --- Cross-domain (identity chaining to partner.example) ------------------------------
+    fed = dict(token_ep=stack.mtls_token_endpoint, ca=stack.container_ca, user_token=alice, client_id="analysis-agent")
+    g1 = in_container("analysis-agent", FEDERATE, **fed)                    # a grant for analysis-agent
+    g2 = in_container("analysis-agent", FEDERATE, **fed, redeem=True)       # grant + partner token
+    if not (g1.get("grant") and g2.get("partner_token")):
+        print("could not obtain a federation grant / partner token for the cross-domain checks:", g1, g2)
+        return 1
+
+    # 10. A grant minted for analysis-agent redeemed by another (federated) workload.
+    out = in_container("remediation-agent", REDEEM, assertion=g1.get("grant") or "")
+    checks.append(("Federation grant redeemed by a different workload (holder-of-key)",
+                   out.get("status") == 400 and "different client certificate" in out.get("body", ""), out))
+
+    # 11. The same grant redeemed twice by its rightful holder.
+    first = in_container("analysis-agent", REDEEM, assertion=g1.get("grant") or "")
+    again = in_container("analysis-agent", REDEEM, assertion=g1.get("grant") or "")
+    checks.append(("Federation grant replayed (single-use jti)",
+                   first.get("status") == 200 and again.get("status") == 400 and "replay" in again.get("body", ""),
+                   again))
+
+    # 12. Asking our AS for a grant to a partner that is not on the agent's egress allowlist.
+    out = exchange("analysis-agent", **{**te, "client_id": "analysis-agent", "scope": "partner:status.read",
+                                        "resource": "https://evil-as.example:8443"})
+    checks.append(("Grant for a partner not on the egress allowlist", out.get("status") in (400, 401), out))
+
+    # 13. Smuggling an egress scope into an internal token (it may only leave inside a grant).
+    out = exchange("analysis-agent", **{**te, "client_id": "analysis-agent", "scope": "systems:read partner:status.read"})
+    checks.append(("Egress scope requested in an internal token", out.get("status") in (400, 401), out))
+
+    # 14. demo.local's internal delegated token presented directly to the partner API.
+    out = in_container("analysis-agent", PARTNER_CALL, token=stolen)
+    checks.append(("Internal token used at the external API (foreign issuer)",
+                   out.get("status") == 401 and stolen != "", out))
+
+    # 15. A partner token lifted from analysis-agent and used by another workload.
+    out = in_container("remediation-agent", PARTNER_CALL, token=g2.get("partner_token") or "")
+    checks.append(("Partner token replayed by a different workload (cnf binding)",
+                   out.get("status") == 401 and "not bound" in (out.get("www") or ""), out))
+
+    # 16. Control: the rightful agent calls the partner API with its partner token.
+    out = in_container("analysis-agent", PARTNER_CALL, token=g2.get("partner_token") or "")
+    checks.append(("Control: partner token used by the agent it was issued to", out.get("status") == 200, out))
 
     # 9. Positive control: the legitimate agent with the legitimate token works.
     legit = in_container("analysis-agent", CALL_WITH_OWN_SVID, url="https://systems-api:8443/systems/payments-api",

@@ -211,7 +211,7 @@ def configure_runtime_tls(api: Api):
 
 
 def configure_scopes(api: Api):
-    bad = [n for n in POLICY["scopes"] if not re.fullmatch(r"[A-Za-z0-9:_-]+", n)]
+    bad = [n for n in POLICY["scopes"] if not re.fullmatch(r"[A-Za-z0-9:._-]+", n)]
     if bad:  # scope names are embedded in OGNL regexes below
         raise SystemExit(f"unsupported characters in scope names: {bad}")
     settings = api.get("/oauth/authServerSettings")
@@ -326,7 +326,11 @@ def configure_user_tokens(api: Api):
 def configure_delegation(api: Api, issuer_dn: str):
     agents = {k: c for k, c in POLICY["clients"].items()
               if c.get("token_endpoint_auth_method") == "tls_client_auth"}
-    resources = sorted({r for c in agents.values() for r in c["allowed_resources"]})
+    federation = POLICY.get("federation", {})
+    partner_as = {f["authorization_server"] for f in federation.values()}
+    egress = sorted({sc for f in federation.values() for sc in f["scopes"]})
+    # Internal resources only; partner authorization servers get federation grants (below).
+    resources = sorted({r for c in agents.values() for r in c["allowed_resources"]} - partner_as)
     portal_id = next(k for k, c in POLICY["clients"].items() if c.get("redirect_uris"))
     subject_auds = sorted({a for c in agents.values() for a in c["subject_token_audiences"]})
 
@@ -378,19 +382,33 @@ def configure_delegation(api: Api, issuer_dn: str):
 
     def leftover(words_expr):
         # Remove every allowed word from " <requested> "; whatever remains is not allowed.
-        return f'#req.replaceAll(" (?:" + {words_expr}.trim().replaceAll(" +", "|") + ")(?= )", "").trim()'
+        # (dots are escaped: scope names such as partner:status.read are regex-literal words)
+        return (f'#req.replaceAll(" (?:" + {words_expr}.trim().replace(".", "\\\\.").replaceAll(" +", "|")'
+                ' + ")(?= )", "").trim()')
 
     within_user = (
         f'{subject_json}, '
         '#req = " " + @java.lang.String@join(" ", #this.get("context.OAuthScopes").getValues()) + " ", '
         f'{leftover(claim("entitlements"))}.isEmpty() && {leftover(claim("scope"))}.isEmpty()'
     )
-    allowed_resources = "|".join(f"\\\\Q{r}\\\\E" for r in resources)
-    resources_ok = (
-        f'#r = {req}.getParameterValues("resource"), #r != null && #r.length > 0 && '
-        f'@java.util.Arrays@toString(#r).replaceAll("^\\\\[|\\\\]$", "")'
-        f'.replaceAll("(?:^|(?<=, ))(?:{allowed_resources})(?=, |$)", "").replaceAll("[ ,]", "").isEmpty()'
-    )
+    def resources_within(allowed):
+        alternatives = "|".join(f"\\\\Q{r}\\\\E" for r in allowed)
+        return (f'#r = {req}.getParameterValues("resource"), #r != null && #r.length > 0 && '
+                f'@java.util.Arrays@toString(#r).replaceAll("^\\\\[|\\\\]$", "")'
+                f'.replaceAll("(?:^|(?<=, ))(?:{alternatives})(?=, |$)", "").replaceAll("[ ,]", "").isEmpty()')
+
+    def no_scopes_from(words):
+        """None of the requested scopes is in `words`."""
+        listed = '" ' + " ".join(words) + ' "'
+        return (f'#req = " " + @java.lang.String@join(" ", #this.get("context.OAuthScopes").getValues()) + " ", '
+                f'{leftover(listed)}.equals(#req.trim())')
+
+    def only_scopes_from(words):
+        listed = '" ' + " ".join(words) + ' "'
+        return (f'#req = " " + @java.lang.String@join(" ", #this.get("context.OAuthScopes").getValues()) + " ", '
+                f'{leftover(listed)}.isEmpty()')
+
+    resources_ok = resources_within(resources)
     cert_thumbprint = (
         f'#certs = {req}.getAttribute("jakarta.servlet.request.X509Certificate"), '
         '#{"x5t#S256": @java.util.Base64@getUrlEncoder().withoutPadding().encodeToString('
@@ -413,8 +431,44 @@ def configure_delegation(api: Api, issuer_dn: str):
             {"expression": within_user,
              "errorResult": "requested scope exceeds the user's entitlements or the user's token"},
             {"expression": resources_ok, "errorResult": "resource missing or not allowed for agents"},
+            {"expression": no_scopes_from(egress),
+             "errorResult": "egress scopes are only issued inside a federation grant"},
         ]},
     })
+
+    # --- Identity chaining: a JWT authorization grant addressed to a partner AS. Same subject
+    # token, same User ∩ Agent checks, but a pairwise subject, a 60 s lifetime, only that
+    # partner's egress scopes, and the partner AS (from the agent's allowlist) as audience.
+    for trust_domain, fed in federation.items():
+        atm_id = "fedgrant" + re.sub(r"[^a-z0-9]", "", trust_domain)
+        api.upsert("/oauth/accessTokenManagers", jwt_atm(
+            atm_id, f"Federation grants for {trust_domain}", "", max(1, fed.get("grant_ttl", 60) // 60),
+            ["sub", "act", "cnf", "aud"], [fed["authorization_server"]]))
+        pairwise = (
+            f'{subject_json}, #sub = {claim("sub")}.trim(), '
+            '@java.util.Base64@getUrlEncoder().withoutPadding().encodeToString('
+            '@java.security.MessageDigest@getInstance("SHA-256").digest('
+            f'(#sub + "|{trust_domain}|{fed["pairwise_salt"]}").getBytes("UTF-8"))).substring(0, 22)'
+        ) if fed.get("subject") == "pairwise" else None
+        api.upsert_mapping({
+            "context": {"type": "TOKEN_EXCHANGE_PROCESSOR_POLICY", "contextRef": ref("agentdelegation")},
+            "accessTokenManagerRef": ref(atm_id),
+            "attributeContractFulfillment": {
+                "sub": val("EXPRESSION", pairwise) if pairwise else val("TOKEN_EXCHANGE_PROCESSOR_POLICY", "subject"),
+                "act": val("EXPRESSION",
+                           f'#{{"sub": "spiffe://{TRUST_DOMAIN}/agent/" + #this.get("context.ClientId").getValue()}}'),
+                "cnf": val("EXPRESSION", cert_thumbprint),
+                "aud": val("EXPRESSION", f'@java.util.Arrays@asList({req}.getParameterValues("resource"))'),
+            },
+            "issuanceCriteria": {"expressionCriteria": [
+                {"expression": within_user,
+                 "errorResult": "requested scope exceeds the user's entitlements or the user's token"},
+                {"expression": resources_within([fed["authorization_server"]]),
+                 "errorResult": f"a federation grant is addressed to exactly {fed['authorization_server']}"},
+                {"expression": only_scopes_from(fed["scopes"]),
+                 "errorResult": f"only {fed['scopes']} may leave for {trust_domain}"},
+            ]},
+        })
 
     for client_id, c in agents.items():
         api.upsert("/oauth/clients", {
@@ -424,7 +478,8 @@ def configure_delegation(api: Api, issuer_dn: str):
                            "clientCertSubjectDn": f"CN={client_id}, O=SPIRE, C=US"},
             "restrictScopes": True, "restrictedScopes": c["allowed_scopes"],
             "tokenExchangeProcessorPolicyRef": ref("agentdelegation"),
-            "defaultAccessTokenManagerRef": ref("delegatedatm"), "restrictToDefaultAccessTokenManager": True,
+            # Not restricted to the default ATM: a partner AS resource selects its federation-grant ATM.
+            "defaultAccessTokenManagerRef": ref("delegatedatm"), "restrictToDefaultAccessTokenManager": False,
         }, key="clientId")
 
 

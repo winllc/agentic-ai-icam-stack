@@ -29,7 +29,8 @@ CLIENT_SECRET = os.environ.get("OIDC_CLIENT_SECRET", "portal-secret")
 REDIRECT_URI = os.environ.get("OIDC_REDIRECT_URI", "http://localhost:8080/callback")
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "http://localhost:8080")
 SCOPES = os.environ.get("OIDC_SCOPES",
-                        "openid profile email systems:read systems:analyze metrics:read tickets:read tickets:write")
+                        "openid profile email systems:read systems:analyze metrics:read tickets:read tickets:write "
+                        "partner:status.read partner:cases.write")
 AGENTS = {
     "analysis-agent": {"url": os.environ.get("ANALYSIS_AGENT_URL", "http://analysis-agent:8090"),
                        "label": "Analysis agent - diagnostics & telemetry, read-only"},

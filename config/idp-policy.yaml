@@ -17,6 +17,9 @@ scopes:
   metrics:read:    Read telemetry for a system
   tickets:read:    Read incident tickets
   tickets:write:   Open or update incident tickets
+  # Egress scopes: may leave demo.local inside a federation grant (see `federation`).
+  partner:status.read: Read a partner's service status (external API)
+  partner:cases.write: Open support cases with a partner (external API)
 
 users:
   alice:
@@ -25,14 +28,15 @@ users:
     email: alice@demo.local
     groups: [sre-leads]
     # Alice is entitled to everything, including opening tickets.
-    entitlements: [systems:read, systems:analyze, metrics:read, tickets:read, tickets:write]
+    entitlements: [systems:read, systems:analyze, metrics:read, tickets:read, tickets:write,
+                   partner:status.read, partner:cases.write]
   bob:
     password: bob
     name: Bob Chen
     email: bob@demo.local
     groups: [analysts]
-    # Bob can look, but cannot run diagnostics or touch tickets.
-    entitlements: [systems:read, metrics:read]
+    # Bob can look (including at partners), but cannot run diagnostics, touch tickets or open cases.
+    entitlements: [systems:read, metrics:read, partner:status.read]
 
 clients:
   agentic-ai-portal:
@@ -41,7 +45,8 @@ clients:
     grant_types: [authorization_code]
     require_pkce: true
     redirect_uris: [http://localhost:8080/callback]
-    allowed_scopes: [openid, profile, email, systems:read, systems:analyze, metrics:read, tickets:read, tickets:write]
+    allowed_scopes: [openid, profile, email, systems:read, systems:analyze, metrics:read, tickets:read, tickets:write,
+                     partner:status.read, partner:cases.write]
     access_token_audience: agentic-ai-service
     access_token_ttl: 900
 
@@ -50,8 +55,8 @@ clients:
     token_endpoint_auth_method: tls_client_auth            # RFC 8705 mTLS client auth
     tls_client_auth_san_uri: spiffe://demo.local/agent/analysis-agent
     grant_types: [urn:ietf:params:oauth:grant-type:token-exchange]
-    allowed_scopes: [systems:read, systems:analyze, metrics:read, tickets:read]
-    allowed_resources: [https://systems-api:8443, https://ops-mcp:8443/mcp]
+    allowed_scopes: [systems:read, systems:analyze, metrics:read, tickets:read, partner:status.read]
+    allowed_resources: [https://systems-api:8443, https://ops-mcp:8443/mcp, https://partner-as:8443]
     subject_token_audiences: [agentic-ai-service]          # whose user tokens it may exchange
     access_token_ttl: 300
 
@@ -60,7 +65,19 @@ clients:
     token_endpoint_auth_method: tls_client_auth
     tls_client_auth_san_uri: spiffe://demo.local/agent/remediation-agent
     grant_types: [urn:ietf:params:oauth:grant-type:token-exchange]
-    allowed_scopes: [systems:read, tickets:read, tickets:write]
-    allowed_resources: [https://systems-api:8443, https://ops-mcp:8443/mcp]
+    allowed_scopes: [systems:read, tickets:read, tickets:write, partner:status.read, partner:cases.write]
+    allowed_resources: [https://systems-api:8443, https://ops-mcp:8443/mcp, https://partner-as:8443]
     subject_token_audiences: [agentic-ai-service]
     access_token_ttl: 300
+
+# Cross-domain identity chaining (draft-ietf-oauth-identity-chaining): an agent exchanges the
+# user's token for a short-lived JWT authorization grant addressed to a partner's AS, then
+# redeems it there (RFC 7523 jwt-bearer). Only the scopes listed here may leave demo.local,
+# and only for agents whose allowed_resources include the partner AS.
+federation:
+  partner.example:
+    authorization_server: https://partner-as:8443
+    scopes: [partner:status.read, partner:cases.write]
+    subject: pairwise          # the partner never sees internal user ids
+    pairwise_salt: demo-pairwise-salt
+    grant_ttl: 60              # seconds; single-use at the partner (jti)

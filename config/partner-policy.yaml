@@ -1,0 +1,23 @@
+# Policy of the EXTERNAL partner (trust domain partner.example). The partner decides what to
+# accept from demo.local: it trusts demo.local's authorization server as an assertion issuer
+# and demo.local's SPIFFE trust domain for client authentication, then applies its own limits.
+
+issuer: https://partner-as:8443
+token_ttl: 300
+
+# Assertion issuers this AS accepts JWT authorization grants from (RFC 7523).
+# iss / jwks_uri are injected per mode (simulator vs real PingFederate) via environment.
+trusted_issuers:
+  demo.local:
+    trust_domain: demo.local             # grant's actor must authenticate with an SVID from here
+    max_grant_lifetime: 120              # seconds; reject longer-lived grants
+    scopes: [partner:status.read, partner:cases.write]   # the most this org can ever get
+
+# Federated clients, identified by SPIFFE ID (mTLS). The partner's own per-client ceiling.
+clients:
+  spiffe://demo.local/agent/analysis-agent:
+    scopes: [partner:status.read]
+  spiffe://demo.local/agent/remediation-agent:
+    scopes: [partner:status.read, partner:cases.write]
+
+resources: [https://partner-api:8443]

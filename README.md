@@ -5,7 +5,8 @@ PingFederate (OIDC + PKCE) and gives an agent a task. The agent instance gets it
 own **SPIFFE workload identity** from SPIRE. It then **exchanges the user's token**
 for a short-lived delegated token, scoped to *User ∩ Agent ∩ Requested* and bound
 to the agent's X.509-SVID, and uses that token to call enterprise REST and MCP
-resources over mTLS.
+resources over mTLS. It can also call an **external partner's API in another trust domain**
+(`partner.example`) through cross-domain identity chaining over SPIFFE federation.
 
 ```
 User ─1─► Agentic AI Service ─2 OIDC+PKCE─► PingFederate ─3 tokens─► Agentic AI Service
@@ -18,6 +19,11 @@ User ─1─► Agentic AI Service ─2 OIDC+PKCE─► PingFederate ─3 tokens
                                                                                          │ 10 API / MCP (mTLS)
                                                                                          ▼
                                                                    Enterprise Resources (systems-api, ops-mcp)
+
+ ── demo.local ─────────────────────────────────────────┼── SPIFFE federation ── partner.example ──────────
+ AI Agent ─11 Token Exchange (resource = partner AS)─► PingFederate ─12 JWT grant (pairwise sub, 60 s)─► AI Agent
+ AI Agent ─13 jwt-bearer grant + mTLS (federated SVID)─► Partner AS ── partner token ──► AI Agent
+ AI Agent ─14 API calls (partner token + mTLS)─► Partner API
 ```
 
 ## Quick start
@@ -40,8 +46,8 @@ trust in your browser.
 To check everything from the command line (needs `pip install requests`). Both scripts detect the mode:
 
 ```bash
-python3 scripts/smoke_test.py        # browser flow, 2 users × 2 agents, asserts scope intersection + cnf/act
-python3 scripts/security_checks.py   # 8 attacks/policy violations that must fail + 1 positive control
+python3 scripts/smoke_test.py        # browser flow, 2 users × 2 agents, steps 1-14, scope intersections + cnf/act
+python3 scripts/security_checks.py   # 14 attacks/policy violations that must fail + 2 positive controls
 ```
 
 Stop with `docker compose down` (add the same `-f` files in mode B). Add `-v` to wipe all state.
@@ -67,7 +73,10 @@ model only sees data the delegated token allowed the agent to read.
 | `spire-agent` | SPIRE Agent: Workload API socket, docker workload attestor | internal |
 | `systems-api` | Enterprise REST API (inventory, metrics, diagnostics) | internal `8443` mTLS |
 | `ops-mcp` | Enterprise MCP server (runbooks, tickets), Streamable HTTP, OAuth per tool | internal `8443` mTLS |
-| `pki-init`, `spire-register` | One-shot jobs: node-attestation PKI, registration entries, trust bundle | – |
+| `pki-init`, `spire-register` | One-shot jobs: node-attestation PKI (both domains), demo TLS CA, SPIFFE federation bootstrap, registration entries | – |
+| `spire-server-partner`, `spire-agent-partner` | The external partner's SPIRE (trust domain `partner.example`), federated with `demo.local` via bundle endpoints | internal |
+| `partner-as` | Partner's authorization server: redeems JWT-bearer grants from `demo.local`, issues its own tokens | internal `8443` mTLS |
+| `partner-api` | Partner's external API (vendor service status, support cases). Accepts only partner-AS tokens. | internal `8443` mTLS |
 
 ## What happens, step by step
 
@@ -96,8 +105,29 @@ model only sees data the delegated token allowed the agent to read.
     signature, issuer, audience, **certificate binding**, **actor = mTLS peer**, and scope.
     Missing scope returns `403 insufficient_scope` (MCP authorization spec style).
 
-The UI shows every step with its details. Step 9 renders the scope intersection and
-step 10 shows each call's allow/deny decision.
+Steps 11–14 run when the system depends on a partner's service. `payments-api` depends on
+`fraud-scoring` from `partner.example`:
+
+11. **Discovery + token exchange for a grant**: the agent reads the partner API's RFC 9728
+    protected-resource metadata to find the partner's authorization server. It then asks our
+    PingFederate, over the same mTLS client authentication, for a grant with
+    `resource = https://partner-as:8443`, and requests only egress scopes:
+    `task needs ∩ agent ceiling ∩ user`.
+12. **JWT authorization grant** (draft-ietf-oauth-identity-chaining): `aud` = the partner AS,
+    `sub` = a **pairwise** pseudonym, so the partner never sees `alice`. It is valid for 60 s,
+    has a `jti`, and is bound to the agent's SVID (`cnf`) with the agent as `act`. Only scopes
+    the policy lists for that partner may leave, and only for agents whose egress allowlist
+    includes it. Egress scopes are never put in internal tokens.
+13. **Redeem at the partner** (RFC 7523 jwt-bearer): mTLS with the same SVID, which the partner
+    trusts through SPIFFE federation. The partner checks the signature against our JWKS, the
+    audience, lifetime, single use, holder-of-key and actor, then applies **its own** policy:
+    grant ∩ its client ceiling. It issues its own token for `partner-api`, bound to the same SVID,
+    with provenance (`federated.iss`, `grant_jti`).
+14. **External API calls**: mTLS across trust domains plus the partner token. `partner-api`
+    rejects tokens from any other issuer, including our internal ones.
+
+The UI shows every step with its details. Steps 9, 12 and 13 render the scope intersections,
+and steps 10 and 14 show each call's allow/deny decision.
 
 ## The policy
 
@@ -112,6 +142,14 @@ needs `systems:read systems:analyze metrics:read tickets:read tickets:write`.
 Neither the user's entitlements nor the agent's ceiling can be exceeded, and an
 agent only gets what the task asked for.
 
+**Egress to `partner.example`** (`federation` in the same file, plus the partner's own
+[`config/partner-policy.yaml`](config/partner-policy.yaml)):
+
+| | analysis-agent (egress `partner:status.read`) | remediation-agent (egress `partner:status.read partner:cases.write`) |
+|---|---|---|
+| **alice** (both partner scopes) | reads vendor status; opening a support case gets **403** from the partner | reads vendor status and **opens a support case** |
+| **bob** (`partner:status.read`) | reads vendor status | reads vendor status; opening a case gets **403** |
+
 ## Security properties demonstrated (`scripts/security_checks.py`)
 
 | Attack / violation | Stopped by |
@@ -124,14 +162,21 @@ agent only gets what the task asked for.
 | Agent uses the user's raw token at a resource | audience restriction, no `cnf` |
 | Non-workload client calls a resource | TLS handshake requires a SPIFFE client cert |
 | Re-delegating a delegated token | subject token must be a user token from the portal |
+| Federation grant redeemed by a different workload | partner AS: grant `cnf` must match the mTLS client certificate |
+| Federation grant redeemed twice | partner AS: single-use `jti`, consumed only after holder-of-key passes (no DoS by burning) |
+| Grant requested for a partner not on the agent's allowlist | our AS: `invalid_target` |
+| Egress scope smuggled into an internal token | our AS: egress scopes only inside a federation grant |
+| Internal token presented to the partner API | partner API trusts only the partner AS as issuer |
+| Partner token replayed by a different workload | partner API: `cnf` binding |
 
 ## Layout
 
 ```
 docker-compose.yml               the stack
 docker-compose.pingfederate.yml  overlay: real PingFederate 13.1 instead of the simulator
-config/idp-policy.yaml           users, clients, agent ceilings
-spire/                           server/agent config, PKI + registration scripts
+config/idp-policy.yaml           users, clients, agent ceilings, federation (egress) policy
+config/partner-policy.yaml       the external partner's own policy
+spire/                           server/agent config (demo.local + partner/), PKI, federation + registration
 services/icam/
   common/                        Workload API helper, JWT validation
   idp/                           PingFederate-compatible AS (simulator)
@@ -139,6 +184,7 @@ services/icam/
   portal/                        Agentic AI Service
   agent/                         runtime (per-task process) + agent instance
   resources/                     systems-api (REST) and ops-mcp (MCP)
+  partner/                       the external partner: authorization server + API
 scripts/                         smoke test and security checks (both modes)
 pingfederate/                    real-PingFederate guide; license/ (git-ignored)
 ```
@@ -152,4 +198,9 @@ pingfederate/                    real-PingFederate guide; license/ (git-ignored)
 - Workload selectors use a single container label. In production, pin image digests
   (`docker:image_config_digest`) or use the Kubernetes attestor.
 - Werkzeug's development server serves the Python services.
-- Demo passwords and client secret are in `config/idp-policy.yaml`.
+- Demo passwords, client secret and the pairwise salt are in `config/idp-policy.yaml`.
+- Both trust domains run on one Docker host and network. A real partner would be reachable only
+  through its public endpoints: the SPIFFE bundle endpoint, its AS and its API. Its JWKS
+  fetch from our IdP would go over the internet.
+- Agents call the partner directly. An **egress gateway** that performs steps 11–13 on the
+  agents' behalf, adding a partner allowlist, DLP and rate limits, is a common production variant.

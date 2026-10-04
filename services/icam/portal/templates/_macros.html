@@ -4,12 +4,12 @@
 <div class="step"><div class="num {{ s.status }}">{{ s.n }}</div><div>
 <h3>{{ s.title }}</h3><div class="actor">{{ s.actor }}{% if s.status not in ('ok',) %} &middot; <b>{{ s.status }}</b>{% endif %}</div>
 {% set d = s.detail %}
-{% if s.n == 9 and d.policy_evaluation %}
- {% set p = d.policy_evaluation %}
- <table class="scopes">{{ scopes('User token', p.user_scopes) }}{{ scopes('Agent allowed', p.agent_scopes) }}{{ scopes('Task needs', p.requested_scopes) }}{{ scopes('= Delegated', p.granted_scopes, 'g') }}</table>
+{% if d.policy_evaluation %}
+ {% set p = d.policy_evaluation %}{% set l = p.labels or ['User token', 'Agent allowed', 'Task needs'] %}
+ <table class="scopes">{{ scopes(l[0], p.user_scopes) }}{{ scopes(l[1], p.agent_scopes) }}{{ scopes(l[2], p.requested_scopes) }}{% if p.granted_scopes is defined %}{{ scopes('= Granted', p.granted_scopes, 'g') }}{% endif %}</table>
  {% if p.denied %}<div class="small" style="margin-top:6px">{% for sc, why in p.denied.items() %}<span class="chip x">{{ sc }}</span> {{ why }}&nbsp; {% endfor %}</div>{% endif %}
- <div class="small mute" style="margin-top:6px">sub=<code>{{ d.claims.sub }}</code> {% if d.claims.act %}act.sub=<code>{{ d.claims.act.sub }}</code>{% endif %} {% if d.claims.cnf %}cnf.x5t#S256=<code>{{ d.claims.cnf['x5t#S256'][:16] }}…</code>{% endif %}</div>
-{% elif s.n == 10 and d.calls %}
+ {% if d.claims %}<div class="small mute" style="margin-top:6px">sub=<code>{{ d.claims.sub }}</code> {% if d.claims.act %}act.sub=<code>{{ d.claims.act.sub }}</code>{% endif %} {% if d.claims.aud %}aud=<code>{{ d.claims.aud }}</code>{% endif %} {% if d.claims.cnf %}cnf.x5t#S256=<code>{{ d.claims.cnf['x5t#S256'][:16] }}…</code>{% endif %}</div>{% endif %}
+{% elif d.calls %}
  <table><tr><th>Type</th><th>Operation</th><th>Scope</th><th>Result</th></tr>
  {% for c in d.calls %}<tr><td>{{ c.kind }}</td><td><code>{{ c.operation }}</code></td><td><span class="chip">{{ c.scope }}</span></td>
  <td>{% if c.outcome == 'allowed' %}<span class="allowed">{{ c.http_status }} allowed</span>{% else %}<span class="deny">{{ c.http_status }}</span> <span class="small mute">{{ c.outcome }}</span>{% endif %}</td></tr>{% endfor %}</table>

@@ -6,28 +6,31 @@ PKI=/pki
 mkdir -p "$PKI"
 cd "$PKI"
 
-if [[ ! -f node-ca.crt ]]; then
-  echo "[pki-init] creating node CA"
-  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-    -keyout node-ca.key -out node-ca.crt -days 3650 \
-    -subj "/O=Agentic AI ICAM Demo/CN=Demo Node CA" \
-    -addext "basicConstraints=critical,CA:TRUE" \
-    -addext "keyUsage=critical,keyCertSign,cRLSign"
-fi
-
-if [[ ! -f node-agent.crt ]]; then
-  echo "[pki-init] issuing node certificate for the SPIRE agent host"
-  openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-    -keyout node-agent.key -out node-agent.csr -subj "/O=Agentic AI ICAM Demo/CN=docker-host"
-  cat > node-agent.ext <<EXT
-basicConstraints=critical,CA:FALSE
-keyUsage=critical,digitalSignature
-extendedKeyUsage=clientAuth
-EXT
-  openssl x509 -req -in node-agent.csr -CA node-ca.crt -CAkey node-ca.key -CAcreateserial \
-    -out node-agent.crt -days 825 -extfile node-agent.ext
-  rm -f node-agent.csr node-agent.ext
-fi
+# node_pki <prefix> <CN>: a node CA and one node certificate for x509pop node attestation.
+node_pki() {
+  local p=$1 cn=$2
+  if [[ ! -f $p-ca.crt ]]; then
+    echo "[pki-init] creating $p CA"
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+      -keyout $p-ca.key -out $p-ca.crt -days 3650 \
+      -subj "/O=Agentic AI ICAM Demo/CN=Demo ${p} CA" \
+      -addext "basicConstraints=critical,CA:TRUE" \
+      -addext "keyUsage=critical,keyCertSign,cRLSign"
+  fi
+  if [[ ! -f $p-agent.crt ]]; then
+    echo "[pki-init] issuing $p certificate CN=$cn for its SPIRE agent"
+    openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+      -keyout $p-agent.key -out $p-agent.csr -subj "/O=Agentic AI ICAM Demo/CN=$cn"
+    printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' > $p-agent.ext
+    openssl x509 -req -in $p-agent.csr -CA $p-ca.crt -CAkey $p-ca.key -CAcreateserial \
+      -out $p-agent.crt -days 825 -extfile $p-agent.ext
+    rm -f $p-agent.csr $p-agent.ext
+  fi
+  chmod 0644 $p-ca.crt $p-agent.crt
+  chmod 0600 $p-ca.key $p-agent.key
+}
+node_pki node docker-host            # trust domain demo.local
+node_pki partner-node partner-host   # trust domain partner.example (the external partner)
 
 # Demo TLS CA + server certificate for a real PingFederate (docker-compose.pingfederate.yml).
 # Stable across PingFederate re-creation, and importable into a browser to avoid warnings.
@@ -55,7 +58,6 @@ chmod 0644 tls/demo-tls-ca.crt tls/pingfederate.crt tls/pingfederate.p12
 chmod 0600 tls/demo-tls-ca.key tls/pingfederate.key
 
 # spire-server runs as uid 1000 in the upstream image.
-chmod 0644 node-ca.crt node-agent.crt
-chmod 0600 node-ca.key node-agent.key
-chown -R 1000:1000 /spire-server-data /spire-server-socket 2>/dev/null || true
+chown -R 1000:1000 /spire-server-data /spire-server-socket \
+  /partner-server-data /partner-server-socket 2>/dev/null || true
 echo "[pki-init] done"

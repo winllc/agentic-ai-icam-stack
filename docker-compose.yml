@@ -6,7 +6,9 @@
 #           Agent Runtime ─► Agent Instance ─(Workload API)─► SPIRE Agent ─► SPIRE Server
 #                                 │  X.509-SVID
 #                                 ├─(Token Exchange + mTLS)─► PingFederate ─► delegated token
-#                                 └─(mTLS + bound token)───► Enterprise Resources (REST API, MCP server)
+#                                 ├─(mTLS + bound token)───► Enterprise Resources (REST API, MCP server)
+#                                 └─(identity chaining)────► partner.example: Partner AS ─► Partner API
+#                                    JWT grant from PingFederate, redeemed over SPIFFE-federated mTLS
 #
 # `docker compose up --build` then open http://localhost:8080 (alice/alice or bob/bob).
 
@@ -60,6 +62,8 @@ services:
       - spire-pki:/pki
       - spire-server-data:/spire-server-data
       - spire-server-socket:/spire-server-socket
+      - partner-server-data:/partner-server-data
+      - partner-server-socket:/partner-server-socket
 
   spire-server:
     image: ghcr.io/spiffe/spire-server:${SPIRE_VERSION:-1.13.3}
@@ -77,6 +81,23 @@ services:
       test: ["CMD", "/opt/spire/bin/spire-server", "healthcheck", "-socketPath", "/tmp/spire-server/private/api.sock"]
       <<: *http-health
 
+  # The external partner's SPIRE Server (trust domain partner.example), federated with ours.
+  spire-server-partner:
+    image: ghcr.io/spiffe/spire-server:${SPIRE_VERSION:-1.13.3}
+    command: ["-config", "/opt/spire/conf/server/server.conf"]
+    restart: unless-stopped
+    depends_on:
+      pki-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./spire/partner/server.conf:/opt/spire/conf/server/server.conf:ro
+      - spire-pki:/opt/spire/pki:ro
+      - partner-server-data:/var/lib/spire/server/data
+      - partner-server-socket:/tmp/spire-server/private
+    healthcheck:
+      test: ["CMD", "/opt/spire/bin/spire-server", "healthcheck", "-socketPath", "/tmp/spire-server/private/api.sock"]
+      <<: *http-health
+
   spire-register:
     image: agentic-icam/spire-tools:latest
     command: ["register.sh"]
@@ -85,9 +106,12 @@ services:
         condition: service_completed_successfully
       spire-server:
         condition: service_healthy
+      spire-server-partner:
+        condition: service_healthy
     volumes:
       - spire-pki:/pki
       - spire-server-socket:/tmp/spire-server/private
+      - partner-server-socket:/tmp/spire-server-partner/private
 
   spire-agent:
     image: ghcr.io/spiffe/spire-agent:${SPIRE_VERSION:-1.13.3}
@@ -105,6 +129,25 @@ services:
       - ./spire/agent/agent.conf:/opt/spire/conf/agent/agent.conf:ro
       - spire-pki:/opt/spire/pki:ro
       - spire-agent-socket:/run/spire/sockets
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro
+    healthcheck:
+      test: ["CMD", "/opt/spire/bin/spire-agent", "healthcheck", "-socketPath", "/run/spire/sockets/agent.sock"]
+      <<: *http-health
+
+  spire-agent-partner:
+    image: ghcr.io/spiffe/spire-agent:${SPIRE_VERSION:-1.13.3}
+    command: ["-config", "/opt/spire/conf/agent/agent.conf"]
+    restart: unless-stopped
+    user: "0"
+    pid: host
+    cgroup: host
+    depends_on:
+      spire-register:
+        condition: service_completed_successfully
+    volumes:
+      - ./spire/partner/agent.conf:/opt/spire/conf/agent/agent.conf:ro
+      - spire-pki:/opt/spire/pki:ro
+      - partner-agent-socket:/run/spire/sockets
       - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro
     healthcheck:
       test: ["CMD", "/opt/spire/bin/spire-agent", "healthcheck", "-socketPath", "/run/spire/sockets/agent.sock"]
@@ -212,8 +255,52 @@ services:
       RESOURCE_URI: https://ops-mcp:8443/mcp
     healthcheck: *tcp-health
 
+  # ------------------------------------------------------------------ External partner (partner.example)
+  partner-as:
+    <<: *python-service
+    command: ["python", "-m", "icam.partner.authz"]
+    labels:
+      example.partner.spiffe-workload: partner-as
+    depends_on:
+      spire-agent-partner:
+        condition: service_healthy
+    environment:
+      SPIFFE_ENDPOINT_SOCKET: unix:///run/spire/sockets/agent.sock
+      PARTNER_POLICY: /config/partner-policy.yaml
+      # demo.local's assertion issuer (the PingFederate simulator in this mode)
+      ORIGIN_ISSUER: http://localhost:9031
+      ORIGIN_JWKS_URL: http://pingfederate:9031/pf/JWKS
+      HEALTH_PORT: "8443"
+    volumes:
+      - partner-agent-socket:/run/spire/sockets:ro
+      - ./config/partner-policy.yaml:/config/partner-policy.yaml:ro
+    healthcheck: *tcp-health
+
+  partner-api:
+    <<: *python-service
+    command: ["python", "-m", "icam.partner.api"]
+    labels:
+      example.partner.spiffe-workload: partner-api
+    depends_on:
+      spire-agent-partner:
+        condition: service_healthy
+    environment:
+      SPIFFE_ENDPOINT_SOCKET: unix:///run/spire/sockets/agent.sock
+      # Only the partner's own AS is trusted here - never demo.local's tokens.
+      PF_ISSUER: https://partner-as:8443
+      PF_JWKS_URL: https://partner-as:8443/jwks
+      PF_TLS_CA: /run/svid/bundle.pem
+      RESOURCE_URI: https://partner-api:8443
+      HEALTH_PORT: "8443"
+    volumes:
+      - partner-agent-socket:/run/spire/sockets:ro
+    healthcheck: *tcp-health
+
 volumes:
   spire-pki:
   spire-server-data:
   spire-server-socket:
   spire-agent-socket:
+  partner-server-data:
+  partner-server-socket:
+  partner-agent-socket:

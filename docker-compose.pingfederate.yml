@@ -108,5 +108,20 @@ services:
 
   ops-mcp: *resource-overrides
 
+  partner-as:
+    environment:
+      ORIGIN_ISSUER: https://localhost:9031
+      ORIGIN_JWKS_URL: https://pingfederate:9031/pf/JWKS
+      ORIGIN_TLS_CA: /pf-trust/pf-ca.pem
+    volumes: !override
+      - partner-agent-socket:/run/spire/sockets:ro
+      - ./config/partner-policy.yaml:/config/partner-policy.yaml:ro
+      - pf-trust:/pf-trust:ro
+    depends_on: !override
+      spire-agent-partner:
+        condition: service_healthy
+      pf-configurator:
+        condition: service_healthy
+
 volumes:
   pf-trust:
