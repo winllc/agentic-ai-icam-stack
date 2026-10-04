@@ -2,7 +2,7 @@
 {% block body %}
 <p><a href="/">← back</a></p>
 <div class="card"><h2>{{ r.task }}</h2>
-<div class="small mute">agent <code>{{ r.agent }}</code> &middot; system <code>{{ r.system }}</code>{% if r.task_id %} &middot; task {{ r.task_id }}{% endif %}{% if r.elapsed_ms %} &middot; {{ r.elapsed_ms }} ms{% endif %}</div>
+<div class="small mute">agent <code>{{ r.agent }}</code> &middot; systems chosen by the agent: {% for t in (r.targets or []) %}<code>{{ t }}</code> {% else %}—{% endfor %}{% if r.task_id %} &middot; task {{ r.task_id }}{% endif %}{% if r.elapsed_ms %} &middot; {{ r.elapsed_ms }} ms{% endif %}</div>
 {% if r.error %}<p class="deny">{{ r.error }}</p>{% endif %}
 {% if r.findings %}<p>Severity: <span class="sev {{ r.findings.severity }}">{{ r.findings.severity }}</span></p>{% endif %}
 {% if r.summary %}<div class="summary">{{ r.summary.text }}</div><div class="small mute" style="margin-top:6px">summary engine: {{ r.summary.engine }}{% if r.summary.llm_note %} ({{ r.summary.llm_note }}){% endif %}</div>{% endif %}

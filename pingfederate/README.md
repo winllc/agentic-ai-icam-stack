@@ -7,7 +7,7 @@ same file the simulator reads. Nothing is configured by hand.
 
 Tested end to end on PingFederate 13.1.3 with a development license.
 `scripts/smoke_test.py` passes 4/4 (steps 1–14, including the cross-domain call to
-`partner.example`), `scripts/security_checks.py` passes 20/20 (plus one reported Vault GAP) and `scripts/governance_checks.py` 7/7. A
+`partner.example`), `scripts/security_checks.py` passes 24/24 (plus one reported Vault GAP) and `scripts/governance_checks.py` 7/7. A
 forced SPIRE CA rotation and a re-created PingFederate container both recover
 automatically.
 
@@ -73,6 +73,15 @@ pin is enforced on every connection instead of disabling verification.
 - For the federation grant the agent sends no `requested_token_type`. PingFederate only issues
   `urn:ietf:params:oauth:token-type:jwt` through token-generator plugins, so it would reject
   that type. The grant comes from the federation-grant ATM, which already issues a signed JWT.
+- **Task binding (RFC 9396).** PingFederate 13.1 has no processor for custom
+  `authorization_details` types, so it rejects the standard parameter. The agents therefore run
+  with `AUTHZ_DETAILS_TRANSPORT=params` and send `task_system=<id>` (repeated) or
+  `task_catalog=true`. The delegation mapping turns these into the same `authorization_details`
+  claim the simulator issues, and an issuance criterion allows only 1–3 lowercase system ids.
+  Resources enforce the claim identically in both modes. A production deployment would use an
+  SDK authorization-detail processor plugin instead (another custom-software item).
+- PingFederate's JWT serializer collapses one-element lists into a plain value
+  (`"aud": "x"`, a single `authorization_details` object). Resources accept both shapes.
 - Logout goes through PingFederate's `/idp/init_logout.openid` (OIDC RP-initiated logout),
   which shows a confirmation page.
 

@@ -12,7 +12,7 @@ from flask import Flask, g, jsonify, request
 
 from icam.common import logs
 from icam.common.tokens import TokenError
-from icam.resources.auth import audit_view, authorize, log_decision, principal
+from icam.resources.auth import audit_view, authorize, log_decision, principal, require_detail, require_system
 from icam.resources.data import RUNBOOKS, SYSTEMS, TICKETS
 from icam.resources.serve import serve_mtls
 
@@ -91,6 +91,12 @@ def mcp():
         required = tool["scope"]
     try:
         g.claims = authorize(required)
+        # Task binding (RFC 9396): any MCP use needs a task token; a tool acting on a system
+        # needs that system in the token's authorization_details.
+        require_detail(g.claims, "system_access")
+        system = ((params.get("arguments") or {}).get("system")) if method == "tools/call" else None
+        if system:
+            require_system(g.claims, system)
     except TokenError as err:
         log_decision(required, None, f"{err.status} {err.error}")
         return err.response(REALM)

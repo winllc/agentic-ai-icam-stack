@@ -55,9 +55,8 @@ def spire_agent_ids() -> set[str]:
 
 
 def run_task(user: str, agent: str) -> dict:
-    s = stack.portal_login(user)
-    return s.post(f"{PORTAL}/task", headers={"Accept": "application/json"},
-                  data={"agent": agent, "system": "payments-api"}).json()
+    from stack import run_task as submit
+    return submit(stack.portal_login(user), agent)
 
 
 def granted(res: dict) -> set[str]:

@@ -4,7 +4,7 @@ from flask import Flask, jsonify
 
 from icam.common import logs
 from icam.resources.auth import audit_view, principal, requires
-from icam.resources.data import SYSTEMS
+from icam.resources.data import SYSTEMS, needs_approval
 from icam.resources.serve import serve_mtls
 
 log = logs.setup("systems-api")
@@ -18,24 +18,27 @@ def find(system_id):
 
 
 @app.get("/systems")
-@requires("systems:read", REALM)
+@requires("systems:read", REALM, detail="system_catalog")
 def list_systems():
-    return jsonify(systems=[{"id": k, "name": v["name"], "status": v["status"]} for k, v in SYSTEMS.items()],
+    """The catalog an agent plans from (needs a discovery token, not a task token)."""
+    return jsonify(systems=[{"id": k, "name": v["name"], "status": v["status"], "criticality": v["criticality"],
+                             "data_classification": v["data_classification"], "keywords": v["keywords"],
+                             "approval_required": needs_approval(v)} for k, v in SYSTEMS.items()],
                    authorized=principal())
 
 
 @app.get("/systems/<system_id>")
-@requires("systems:read", REALM)
+@requires("systems:read", REALM, detail="system_access")
 def get_system(system_id):
     sys, err = find(system_id)
     if err:
         return err
-    fields = {k: v for k, v in sys.items() if k not in ("metrics", "diagnostics")}
+    fields = {k: v for k, v in sys.items() if k not in ("metrics", "diagnostics", "keywords")}
     return jsonify(id=system_id, **fields, authorized=principal())
 
 
 @app.get("/systems/<system_id>/metrics")
-@requires("metrics:read", REALM)
+@requires("metrics:read", REALM, detail="system_access")
 def get_metrics(system_id):
     sys, err = find(system_id)
     if err:
@@ -44,7 +47,7 @@ def get_metrics(system_id):
 
 
 @app.post("/systems/<system_id>/diagnostics")
-@requires("systems:analyze", REALM)
+@requires("systems:analyze", REALM, detail="system_access")
 def run_diagnostics(system_id):
     sys, err = find(system_id)
     if err:

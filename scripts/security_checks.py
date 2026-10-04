@@ -13,7 +13,7 @@ import subprocess
 import sys
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from stack import PORTAL, Stack
+from stack import PORTAL, Stack, run_task
 
 TE = "urn:ietf:params:oauth:grant-type:token-exchange"
 AT = "urn:ietf:params:oauth:token-type:access_token"
@@ -38,9 +38,7 @@ def user_access_token(user: str, scope: str) -> str:
 
 
 def delegated_token_via_portal(user: str, agent: str) -> str:
-    s = stack.portal_login(user)
-    res = s.post(f"{PORTAL}/task", headers={"Accept": "application/json"},
-                 data={"agent": agent, "system": "payments-api"}).json()
+    res = run_task(stack.portal_login(user), agent)
     return res["delegated_token"]["jwt"]
 
 
@@ -222,6 +220,37 @@ def main() -> int:
     # 16. Control: the rightful agent calls the partner API with its partner token.
     out = in_container("analysis-agent", PARTNER_CALL, token=g2.get("partner_token") or "")
     checks.append(("Control: partner token used by the agent it was issued to", out.get("status") == 200, out))
+
+    # --- Task binding (RFC 9396 authorization_details) ----------------------------------
+    # 21. A task token bound to payments-api used against another system (a hijacked agent).
+    out = in_container("analysis-agent", CALL_WITH_OWN_SVID, url="https://systems-api:8443/systems/hr-portal",
+                       headers={"Authorization": f"Bearer {stolen}"})
+    checks.append(("Agent goes outside its approved plan (REST, other system)",
+                   out.get("status") == 403 and "not authorized for system" in (out.get("www") or ""), out))
+
+    # 22. Same via the MCP server: a tool call for a system not in the plan.
+    out = in_container("analysis-agent", CALL_WITH_OWN_SVID, method="POST", url="https://ops-mcp:8443/mcp",
+                       headers={"Authorization": f"Bearer {stolen}", "Content-Type": "application/json"},
+                       data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                        "params": {"name": "get_runbook", "arguments": {"system": "hr-portal"}}}))
+    checks.append(("Agent goes outside its approved plan (MCP tool call)",
+                   out.get("status") == 403 and "not authorized for system" in (out.get("www") or ""), out))
+
+    # 23. A discovery (catalog-only) token cannot read any system's details.
+    cat = exchange("analysis-agent", full=True, **{**te, "client_id": "analysis-agent", "scope": "systems:read",
+                                                   "resource": RESOURCES[:1],
+                                                   **({"task_catalog": "true"} if stack.real_pf else
+                                                      {"authorization_details": json.dumps([{"type": "system_catalog"}])})})
+    cat_tok = json.loads(cat.get("body") or "{}").get("access_token", "") if cat.get("status") == 200 else ""
+    out = in_container("analysis-agent", CALL_WITH_OWN_SVID, url="https://systems-api:8443/systems/erp-db",
+                       headers={"Authorization": f"Bearer {cat_tok}"})
+    checks.append(("Discovery token used to read a system", bool(cat_tok) and out.get("status") == 403, out))
+
+    # 24. A PCI target is not executed without the user's approval (no task token is issued).
+    pending = run_task(stack.portal_login("alice"), "analysis-agent", approve=False)
+    checks.append(("Sensitive target without user approval",
+                   pending.get("status") == "approval_required" and "delegated_token" not in pending,
+                   f"status={pending.get('status')}, needs approval: {pending.get('plan', {}).get('needs_approval')}"))
 
     # --- Vault (credential broker for the legacy inventory database) --------------------
     # 17. The user's own access token (aud = agentic-ai-service) presented to Vault.

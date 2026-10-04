@@ -29,8 +29,9 @@ def submit_task():
         return err.response("agent-runtime")
 
     body = request.get_json(force=True)
-    job = {"task_id": uuid.uuid4().hex[:12], "task": body.get("task", ""),
-           "system": body.get("system", ""), "user_token": token}
+    job = {"task_id": uuid.uuid4().hex[:12], "task": body.get("task", ""), "user_token": token,
+           # A plan the user approved in the Agentic AI Service (held there, not by the agent).
+           "approved_plan": body.get("approved_plan")}
     started = time.time()
     proc = subprocess.run([sys.executable, "-m", "icam.agent.instance"], input=json.dumps(job),
                           capture_output=True, text=True, timeout=180)
@@ -45,7 +46,7 @@ def submit_task():
     result["steps"].insert(0, {
         "n": 4, "title": "Task handed to Agent Runtime → new Agent Instance", "actor": "Agentic AI Service → Agent Runtime",
         "status": "ok",
-        "detail": {"task": job["task"], "system": job["system"], "user": user["sub"],
+        "detail": {"task": job["task"], "approved_plan": job["approved_plan"], "user": user["sub"],
                    "user_token_scope": " ".join(sorted(scopes_of(user))), "runtime": os.environ.get("AGENT_NAME"),
                    "agent_instance_pid": result.get("pid"),
                    "note": "The runtime validated the user's token (signature, issuer, audience) before spawning."},

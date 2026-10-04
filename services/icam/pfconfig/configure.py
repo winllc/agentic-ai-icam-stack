@@ -296,7 +296,8 @@ def configure_authentication(api: Api):
         api.call("DELETE", "/passwordCredentialValidators/demopcv")
 
 
-def jwt_atm(id_: str, name: str, audience: str, lifetime_min: int, attrs: list[str], resources=None) -> dict:
+def jwt_atm(id_: str, name: str, audience: str, lifetime_min: int, attrs: list[str], resources=None,
+            native_authorization_details: bool = True) -> dict:
     atm = {
         "id": id_, "name": name,
         "pluginDescriptorRef": ref("com.pingidentity.pf.access.token.management.plugins.JwtBearerAccessTokenManagementPlugin"),
@@ -307,7 +308,11 @@ def jwt_atm(id_: str, name: str, audience: str, lifetime_min: int, attrs: list[s
                               "Audience Claim Value": audience, "Include Key ID Header Parameter": "true",
                               "JWT ID Claim Length": 22, "Client ID Claim Name": "client_id",
                               "Scope Claim Name": "scope", "Space Delimit Scope Values": "true",
-                              "Include Issued At Claim": "true"})},
+                              "Include Issued At Claim": "true",
+                              # Blank = omit PingFederate's own (processor-driven) claim; the delegated
+                              # token's authorization_details are built by the mapping instead.
+                              "Authorization Details Claim Name":
+                                  "authorization_details" if native_authorization_details else ""})},
         "attributeContract": {"extendedAttributes": [{"name": a, "multiValued": False} for a in attrs],
                               "defaultSubjectAttribute": "sub"},
     }
@@ -413,7 +418,8 @@ def configure_delegation(api: Api, issuer_dn: str):
     api.call("PUT", "/oauth/tokenExchange/processor/settings", {"defaultProcessorPolicyRef": ref("agentdelegation")})
 
     api.upsert("/oauth/accessTokenManagers", jwt_atm(
-        "delegatedatm", "Delegated agent tokens", "", 5, ["sub", "act", "cnf", "aud"], resources))
+        "delegatedatm", "Delegated agent tokens", "", 5, ["sub", "act", "cnf", "aud", "authorization_details"],
+        resources, native_authorization_details=False))
 
     # PingFederate's OGNL can read the token-exchange request (context.HttpRequest) and the
     # requested scopes (context.OAuthScopes). The subject token was already validated by the
@@ -454,6 +460,15 @@ def configure_delegation(api: Api, issuer_dn: str):
                 f'{leftover(listed)}.isEmpty()')
 
     resources_ok = resources_within(resources)
+    task_binding = (
+        f'#sys = {req}.getParameterValues("task_system"), #cat = {req}.getParameter("task_catalog"), '
+        '#sys != null ? { #{"type": "system_access", "systems": #sys.{#this}} } '
+        ': ("true".equals(#cat) ? { #{"type": "system_catalog"} } : null)'
+    )
+    task_binding_ok = (
+        f'#sys = {req}.getParameterValues("task_system"), #sys == null || (#sys.length >= 1 && #sys.length <= 3 '
+        '&& @java.util.Arrays@toString(#sys).matches("\\\\[[a-z0-9-]+(, [a-z0-9-]+)*\\\\]"))'
+    )
     cert_thumbprint = (
         f'#certs = {req}.getAttribute("jakarta.servlet.request.X509Certificate"), '
         '#{"x5t#S256": @java.util.Base64@getUrlEncoder().withoutPadding().encodeToString('
@@ -471,6 +486,9 @@ def configure_delegation(api: Api, issuer_dn: str):
             "cnf": val("EXPRESSION", cert_thumbprint),
             # RFC 8707: audience = the requested resource servers.
             "aud": val("EXPRESSION", f'@java.util.Arrays@asList({req}.getParameterValues("resource"))'),
+            # RFC 9396 task binding, built from the agent's plan (task_system / task_catalog
+            # parameters) because PingFederate 13.1 ships no authorization-details processor.
+            "authorization_details": val("EXPRESSION", task_binding),
         },
         "issuanceCriteria": {"expressionCriteria": [
             {"expression": within_user,
@@ -478,6 +496,8 @@ def configure_delegation(api: Api, issuer_dn: str):
             {"expression": resources_ok, "errorResult": "resource missing or not allowed for agents"},
             {"expression": no_scopes_from(egress),
              "errorResult": "egress scopes are only issued inside a federation grant"},
+            {"expression": task_binding_ok,
+             "errorResult": "task_system must name 1-3 systems (lowercase ids)"},
         ]},
     })
 

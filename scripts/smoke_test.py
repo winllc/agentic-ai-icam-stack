@@ -9,7 +9,7 @@ gets User ∩ Agent ∩ Partner policy with a pairwise subject and the same SVID
 """
 import sys
 
-from stack import PORTAL, Stack
+from stack import PORTAL, Stack, run_task
 
 TASK = {"systems:read", "systems:analyze", "metrics:read", "tickets:read", "tickets:write"}
 USERS = {"alice": {"systems:read", "systems:analyze", "metrics:read", "tickets:read", "tickets:write"},
@@ -30,8 +30,8 @@ def main() -> int:
     for user, entitled in USERS.items():
         s = stack.portal_login(user)
         for agent, allowed in AGENTS.items():
-            res = s.post(f"{PORTAL}/task", headers={"Accept": "application/json"},
-                         data={"agent": agent, "system": "payments-api", "task": "Analyze system payments-api"}).json()
+            res = run_task(s, agent)       # free text: the agent picks the system, the user approves
+
             expected = entitled & allowed & TASK
             claims = res.get("delegated_token", {}).get("claims", {})
             granted = set(claims.get("scope", "").split())
@@ -42,7 +42,14 @@ def main() -> int:
             pclaims = by_n.get(13, {}).get("detail", {}).get("claims") or {}
             partner_granted = set(pclaims.get("scope", "").split())
             pcalls = by_n.get(14, {}).get("detail", {}).get("calls", [])
-            ok = granted == expected and steps == list(range(4, 15))
+            ok = granted == expected and steps == [4, 5, 6, 7, "7a", "7b", "7c", 8, 9, 10, 11, 12, 13, 14]
+            ok &= res.get("approval", {}).get("status") == "approval_required"     # PCI target asked first
+            ok &= res.get("targets") == ["payments-api"]
+            ad = claims.get("authorization_details")
+            ad = ad if isinstance(ad, list) else [ad]          # PingFederate collapses 1-element lists
+            bound = [d for d in ad if isinstance(d, dict) and d.get("type") == "system_access"]
+            systems = bound[0].get("systems") if bound else None
+            ok &= (systems if isinstance(systems, list) else [systems]) == ["payments-api"]
             ok &= partner_granted == partner_expected
             ok &= pclaims.get("sub") not in (None, user)            # pairwise, never the internal id
             ok &= pclaims.get("cnf") == claims.get("cnf")            # bound to the same SVID across domains
@@ -54,12 +61,20 @@ def main() -> int:
                 ok &= (200 <= c["http_status"] < 300) == (c["scope"] in granted)
             ok &= {"VAULT", "SQL"} <= {c["kind"] for c in calls}     # legacy DB via a Vault dynamic user
             failures += not ok
-            print(f"{'PASS' if ok else 'FAIL'}  {user:5} + {agent:17} -> {' '.join(sorted(granted)) or res.get('error')}")
+            print(f"{'PASS' if ok else 'FAIL'}  {user:5} + {agent:17} -> {' '.join(sorted(granted)) or res.get('error')}"
+                  f"  [plan {res.get('targets')} approved]")
             for c in calls + pcalls:
                 print(f"        {c['kind']:4} {c['operation']:38} {c['scope']:20} {c['http_status']}")
             print(f"        partner.example token: scope={' '.join(sorted(partner_granted))} sub={pclaims.get('sub')}")
             if not ok:
                 print("        expected", sorted(expected), "steps", steps, "claims", claims)
+    # A non-sensitive target runs without asking.
+    res = run_task(stack.portal_login("alice"), "analysis-agent",
+                   "Is the ERP database healthy? Finance says invoices are slow", approve=False)
+    ok = res.get("targets") == ["erp-db"] and "approval" not in res and res.get("status") != "approval_required"
+    failures += not ok
+    print(f"{'PASS' if ok else 'FAIL'}  alice + analysis-agent, 'ERP invoices are slow' -> agent picked "
+          f"{res.get('targets')} without asking (not sensitive)")
     print("\nall checks passed" if not failures else f"\n{failures} check(s) failed")
     return 1 if failures else 0
 

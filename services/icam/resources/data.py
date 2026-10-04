@@ -3,6 +3,8 @@
 SYSTEMS = {
     "payments-api": {
         "name": "Payments API", "owner": "payments-team", "tier": "tier-1", "env": "prod",
+        "criticality": "mission-critical", "data_classification": "PCI",
+        "keywords": ["payment", "payments", "checkout", "card", "fraud", "transaction", "customers"],
         "status": "degraded", "version": "4.12.3", "region": "us-east-1",
         "vendor": {"partner": "partner.example", "service": "fraud-scoring", "api": "https://partner-api:8443"},
         "metrics": {"cpu_pct": 71, "mem_pct": 64, "p99_latency_ms": 1840, "error_rate_pct": 4.2, "rps": 1250},
@@ -14,6 +16,8 @@ SYSTEMS = {
     },
     "erp-db": {
         "name": "ERP Database", "owner": "data-platform", "tier": "tier-1", "env": "prod",
+        "criticality": "business-critical", "data_classification": "confidential",
+        "keywords": ["erp", "invoice", "invoices", "finance", "ledger", "database", "vacuum", "backup"],
         "status": "healthy", "version": "PostgreSQL 16.4", "region": "us-east-1",
         "vendor": {"partner": "partner.example", "service": "backup-vault", "api": "https://partner-api:8443"},
         "metrics": {"cpu_pct": 38, "mem_pct": 71, "p99_latency_ms": 22, "error_rate_pct": 0.0, "rps": 640},
@@ -25,6 +29,8 @@ SYSTEMS = {
     },
     "hr-portal": {
         "name": "HR Portal", "owner": "people-tech", "tier": "tier-2", "env": "prod",
+        "criticality": "important", "data_classification": "PII",
+        "keywords": ["hr", "payroll", "employee", "employees", "people", "benefits", "cve", "log4j"],
         "status": "healthy", "version": "2.3.0", "region": "eu-west-1",
         "vendor": {"partner": "partner.example", "service": "payroll-gateway", "api": "https://partner-api:8443"},
         "metrics": {"cpu_pct": 12, "mem_pct": 33, "p99_latency_ms": 310, "error_rate_pct": 0.3, "rps": 40},
@@ -46,3 +52,12 @@ TICKETS = [
     {"id": "INC-1041", "system": "payments-api", "title": "Intermittent 504s from fraud-scoring", "state": "open"},
     {"id": "INC-1038", "system": "erp-db", "title": "Nightly vacuum overran window", "state": "resolved"},
 ]
+
+
+# Targets that need the user's explicit approval before an agent may act on them.
+APPROVAL_CLASSIFICATIONS = {"PCI"}
+APPROVAL_CRITICALITY = {"mission-critical"}
+
+
+def needs_approval(system: dict) -> bool:
+    return system["data_classification"] in APPROVAL_CLASSIFICATIONS or system["criticality"] in APPROVAL_CRITICALITY

@@ -20,6 +20,7 @@ Listeners:
 import base64
 import hashlib
 import html
+import json
 import os
 import secrets
 import threading
@@ -356,11 +357,15 @@ def grant_token_exchange():
     spiffe_id = client["tls_client_auth_san_uri"]
     if partner:
         return federation_grant(subject, client_id, spiffe_id, cert, granted, partner, evaluation, now)
+    details, problem = parse_authorization_details(request.form.get("authorization_details"))
+    if problem:
+        return oauth_error("invalid_authorization_details", problem)
     ttl = client.get("access_token_ttl", 300)
     delegated = sign({
         "iss": ISSUER, "sub": subject["sub"], "aud": resources if len(resources) > 1 else resources[0],
         "client_id": client_id, "scope": ordered(granted), "iat": now, "exp": min(now + ttl, subject["exp"]),
         "jti": uuid.uuid4().hex,
+        **({"authorization_details": details} if details else {}),   # RFC 9396 task binding
         "act": {"sub": spiffe_id, "client_id": client_id},          # RFC 8693 actor = the agent workload
         "cnf": {"x5t#S256": x5t_s256(cert)},                          # RFC 8705 certificate-bound
         "delegated_from": {"client_id": subject.get("client_id"), "jti": subject.get("jti")},
@@ -372,6 +377,31 @@ def grant_token_exchange():
     if EXPLAIN:
         body["demo_policy_evaluation"] = evaluation
     return jsonify(body)
+
+
+AUTHZ_DETAIL_TYPES = {"system_catalog", "system_access"}
+MAX_SYSTEMS_PER_TOKEN = 3
+
+
+def parse_authorization_details(raw: str | None):
+    """RFC 9396 authorization_details for agent tokens: which systems a task may touch."""
+    if not raw:
+        return None, None
+    try:
+        details = json.loads(raw)
+    except ValueError:
+        return None, "authorization_details is not valid JSON"
+    if not isinstance(details, list) or not details:
+        return None, "authorization_details must be a non-empty JSON array"
+    for d in details:
+        if not isinstance(d, dict) or d.get("type") not in AUTHZ_DETAIL_TYPES:
+            return None, f"unsupported authorization_details type {d.get('type') if isinstance(d, dict) else d!r}"
+        if d["type"] == "system_access":
+            systems = d.get("systems")
+            if (not isinstance(systems, list) or not systems or len(systems) > MAX_SYSTEMS_PER_TOKEN
+                    or not all(isinstance(x, str) and x for x in systems)):
+                return None, f"system_access needs 1-{MAX_SYSTEMS_PER_TOKEN} system ids"
+    return details, None
 
 
 def federation_grant(subject, client_id, spiffe_id, cert, granted, partner, evaluation, now):

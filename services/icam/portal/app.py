@@ -37,7 +37,11 @@ AGENTS = {
     "remediation-agent": {"url": os.environ.get("REMEDIATION_AGENT_URL", "http://remediation-agent:8090"),
                           "label": "Remediation agent - may open tickets, no diagnostics"},
 }
-SYSTEMS = {"payments-api": "Payments API", "erp-db": "ERP Database", "hr-portal": "HR Portal"}
+EXAMPLE_TASKS = [
+    "Customers report failed card payments since this morning - find out why",
+    "Is the ERP database healthy? Finance says invoices are slow",
+    "Check the HR portal for security issues before the payroll run",
+]
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("PORTAL_SESSION_KEY") or secrets.token_hex(32)
@@ -71,7 +75,7 @@ def pretty(obj):
 
 @app.get("/")
 def index():
-    return render_template("index.html", user=current(), agents=AGENTS, systems=SYSTEMS, issuer=ISSUER)
+    return render_template("index.html", user=current(), agents=AGENTS, examples=EXAMPLE_TASKS, issuer=ISSUER)
 
 
 # ------------------------------------------------------------------ 1-3: OIDC + PKCE
@@ -153,28 +157,60 @@ def logout():
 
 # ------------------------------------------------------------------ 4-10: delegate to an agent
 
+def run_agent(user: dict, agent: str, task: str, approved_plan: dict | None = None) -> dict:
+    try:
+        resp = requests.post(f"{AGENTS[agent]['url']}/tasks", json={"task": task, "approved_plan": approved_plan},
+                             headers={"Authorization": f"Bearer {user['access_token']}"}, timeout=200)
+        result = resp.json() if resp.ok else {"error": f"agent runtime returned {resp.status_code}: {resp.text}",
+                                              "steps": []}
+    except requests.RequestException as exc:
+        result = {"error": f"agent runtime unreachable: {exc}", "steps": []}
+    result.update(agent=agent, task=task, at=time.strftime("%H:%M:%S"))
+    return result
+
+
+def respond(user: dict, result: dict):
+    if result.get("status") == "approval_required":
+        # The plan the user is asked about is kept HERE (server-side, per session), so what gets
+        # executed is exactly what was approved - the agent cannot swap it.
+        user.setdefault("pending", {})[result["plan"]["plan_id"]] = {
+            "agent": result["agent"], "task": result["task"], "plan": result["plan"]}
+    else:
+        user["results"].insert(0, result)
+    if request.accept_mimetypes.best == "application/json":
+        return result
+    template = "approve.html" if result.get("status") == "approval_required" else "result.html"
+    return render_template(template, user=user, r=result)
+
+
 @app.post("/task")
 def task():
     user = current()
     if not user:
         return redirect(url_for("login"))
     agent = request.form.get("agent", "analysis-agent")
-    system = request.form.get("system", "payments-api")
-    if agent not in AGENTS or system not in SYSTEMS:
-        abort(400)
-    text = request.form.get("task") or f"Analyze system {system}"
-    try:
-        resp = requests.post(f"{AGENTS[agent]['url']}/tasks", json={"task": text, "system": system},
-                             headers={"Authorization": f"Bearer {user['access_token']}"}, timeout=200)
-        result = resp.json() if resp.ok else {"error": f"agent runtime returned {resp.status_code}: {resp.text}",
-                                              "steps": []}
-    except requests.RequestException as exc:
-        result = {"error": f"agent runtime unreachable: {exc}", "steps": []}
-    result.update(agent=agent, task=text, system=system, at=time.strftime("%H:%M:%S"))
-    user["results"].insert(0, result)
-    if request.accept_mimetypes.best == "application/json":
-        return result
-    return render_template("result.html", user=user, r=result)
+    text = (request.form.get("task") or "").strip()
+    if agent not in AGENTS or not text:
+        abort(400, "choose an agent and describe the task")
+    return respond(user, run_agent(user, agent, text))
+
+
+@app.post("/task/approve")
+def approve():
+    user = current()
+    if not user:
+        return redirect(url_for("login"))
+    pending = user.get("pending", {}).pop(request.form.get("plan_id", ""), None)
+    if not pending:
+        abort(400, "unknown or already decided plan")
+    if request.form.get("decision") == "reject":
+        result = {"agent": pending["agent"], "task": pending["task"], "error": "plan rejected by the user",
+                  "steps": [], "plan": pending["plan"], "at": time.strftime("%H:%M:%S")}
+        return respond(user, result)
+    plan = pending["plan"]
+    approved = {"plan_id": plan["plan_id"],
+                "targets": [{"system": t, "reason": plan["reasons"].get(t, "")} for t in plan["targets"]]}
+    return respond(user, run_agent(user, pending["agent"], pending["task"], approved))
 
 
 @app.get("/directory")

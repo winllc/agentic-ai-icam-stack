@@ -107,6 +107,8 @@ services:
     environment:
       <<: *real-pf-env
       PF_MTLS_TOKEN_ENDPOINT: https://pingfederate:9032/as/token.oauth2
+      # PingFederate has no RFC 9396 processor built in: send the plan as task_system/task_catalog.
+      AUTHZ_DETAILS_TRANSPORT: params
     volumes: !override
       - spire-agent-socket:/run/spire/sockets:ro
       - pf-trust:/pf-trust:ro

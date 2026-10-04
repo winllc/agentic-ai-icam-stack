@@ -17,7 +17,7 @@ using the agent's delegated token.
 
 ```
 User ─1─► Agentic AI Service ─2 OIDC+PKCE─► PingFederate ─3 tokens─► Agentic AI Service
-                                                                            │ 4 "Analyze system X"
+                                                                            │ 4 task in plain words
                                                                             ▼
                      SPIRE Server ◄─6 verify selectors── SPIRE Agent ◄─5 Workload API── Agent Runtime / Instance
                                   ──7 X.509-SVID──────────────────────────────────────►  AI Agent (user ctx + SVID)
@@ -54,7 +54,7 @@ To check everything from the command line (needs `pip install requests`). Both s
 
 ```bash
 python3 scripts/smoke_test.py        # browser flow, 2 users × 2 agents, steps 1-14, scope intersections + cnf/act
-python3 scripts/security_checks.py   # 18 attacks/violations that must fail + 2 controls, plus known GAPs
+python3 scripts/security_checks.py   # 22 attacks/violations that must fail + 2 controls, plus known GAPs
 python3 scripts/governance_checks.py # directory mapping, legacy trust, disable/expire/narrow/revoke (~3 min)
 ```
 
@@ -108,17 +108,36 @@ model only sees data the delegated token allowed the agent to read.
    `docker:label:ai.demo.spiffe-workload=<agent>` against the entries registered under
    the attested node.
 7. **SVID**: the instance receives `spiffe://demo.local/agent/<agent>` (1h TTL, DNS SAN = service name).
-8. **Token exchange**: RFC 8693 request to PingFederate's mTLS token endpoint. The client
-   authenticates with its SVID: the simulator matches the SAN URI, and PingFederate matches
+
+The user describes a problem in plain words ("card payments are failing at checkout"). The
+**agent picks the systems**, not the user:
+
+- **7a Discover**: a token exchange for a *catalog-only* token
+  (`authorization_details = [{"type": "system_catalog"}]`, RFC 9396). It can list systems and their
+  metadata (criticality, data classification, keywords) but read none of them.
+- **7b Plan**: the agent maps the task to at most `MAX_PLAN_TARGETS` (2) systems. With
+  `ANTHROPIC_API_KEY` set it asks Claude (structured output; the task and catalog are treated as
+  data, not instructions). Otherwise a keyword planner runs. The planner only proposes.
+- **7c Policy check**: deterministic code checks the plan: targets must exist in the catalog, and
+  the count is capped. **PCI or mission-critical targets need the user's approval**. The run
+  then stops and the portal shows the plan. It holds the plan server-side, so the browser can only
+  approve or reject it, not edit it.
+
+8. **Token exchange**: the same exchange, now **bound to the approved targets** with
+   `authorization_details = [{"type": "system_access", "systems": [...]}]`. It is an RFC 8693
+   request to PingFederate's mTLS token endpoint. The client authenticates with its SVID: the simulator matches the SAN URI, and PingFederate matches
    the SVID's subject/issuer DN. `subject_token` = user's token, `resource` = the two
    enterprise resources. `scope` = what the task needs ∩ the agent's ceiling ∩ the user's
    scopes. The AS **rejects** anything outside User ∩ Agent; it never silently narrows.
 9. **Delegated token**: `scope` = exactly that intersection, `sub = user`,
    `act.sub = agent SPIFFE ID`, `cnf.x5t#S256 = SVID thumbprint`, `aud = resources`,
-   5 min TTL. Exchanging a delegated token again is refused.
+   `authorization_details` = the approved targets, 5 min TTL. Exchanging a delegated token again
+   is refused.
 10. **API / MCP calls**: mTLS with the SVID, with the bearer token checked at each resource for
     signature, issuer, audience, **certificate binding**, **actor = mTLS peer**, and scope.
-    Missing scope returns `403 insufficient_scope` (MCP authorization spec style).
+    Missing scope returns `403 insufficient_scope` (MCP authorization spec style). A system outside
+    the token's `authorization_details` returns `403 insufficient_authorization`, on every REST
+    route and MCP tool call. So even a confused or prompt-injected agent can't drift to other systems.
 
 Steps 11–14 run when the system depends on a partner's service. `payments-api` depends on
 `fraud-scoring` from `partner.example`:
@@ -260,6 +279,11 @@ agent only gets what the task asked for.
 | Egress scope smuggled into an internal token | our AS: egress scopes only inside a federation grant |
 | Internal token presented to the partner API | partner API trusts only the partner AS as issuer |
 | Partner token replayed by a different workload | partner API: `cnf` binding |
+| Agent leaves its approved plan (REST or MCP, another system) | resources: `authorization_details` system binding |
+| Discovery token used to read a system | resources: `system_catalog` allows the catalog only |
+| Sensitive target without the user's approval | agent policy check; the portal holds the plan server-side |
+| User token / token without Vault audience used at Vault; Vault token used beyond policy | Vault JWT role `bound_audiences`, `bound_claims`, least-privilege policy |
+| Database credentials outliving the task | `revoke-self` drops the dynamic user |
 
 ## Layout
 

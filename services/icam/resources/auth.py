@@ -43,6 +43,33 @@ def authorize(required_scope: str) -> dict:
     return claims
 
 
+def _as_list(value) -> list:
+    """PingFederate's JWT serializer collapses one-element lists into a plain value, so
+    accept both shapes for authorization_details and its systems member."""
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def authorization_details(claims: dict, kind: str) -> list[dict]:
+    details = [d for d in _as_list(claims.get("authorization_details")) if isinstance(d, dict) and d.get("type") == kind]
+    return [{**d, "systems": _as_list(d.get("systems"))} if "systems" in d else d for d in details]
+
+
+def require_system(claims: dict, system: str):
+    """RFC 9396 task binding: the token must name this system in a system_access detail.
+    Scopes say WHAT kind of access; authorization_details say WHICH systems this task may touch."""
+    allowed = {s for d in authorization_details(claims, "system_access") for s in d.get("systems", [])}
+    if system not in allowed:
+        raise TokenError(403, "insufficient_authorization",
+                         f"token is not authorized for system {system!r} (task bound to {sorted(allowed)})")
+
+
+def require_detail(claims: dict, kind: str):
+    if not authorization_details(claims, kind):
+        raise TokenError(403, "insufficient_authorization", f"token carries no {kind} authorization_details")
+
+
 def log_decision(required_scope: str, claims: dict | None, outcome: str):
     audit.appendleft({
         "ts": time.strftime("%H:%M:%S"), "path": request.path, "scope": required_scope,
@@ -51,12 +78,18 @@ def log_decision(required_scope: str, claims: dict | None, outcome: str):
     })
 
 
-def requires(scope: str, realm: str):
+def requires(scope: str, realm: str, detail: str | None = None):
+    """detail="system_access": the route's system_id must be in the token's authorization_details;
+    detail="system_catalog": the token must be a discovery (catalog) token."""
     def deco(fn):
         @functools.wraps(fn)
         def wrapper(*a, **kw):
             try:
                 g.claims = authorize(scope)
+                if detail == "system_access":
+                    require_system(g.claims, kw.get("system_id", ""))
+                elif detail:
+                    require_detail(g.claims, detail)
             except TokenError as err:
                 log_decision(scope, None, f"{err.status} {err.error}")
                 return err.response(realm)

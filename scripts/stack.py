@@ -72,3 +72,17 @@ class Stack:
         s.get(r.headers["Location"])          # portal /callback -> /
         assert "Signed in as" in s.get(PORTAL + "/").text, "login failed"
         return s
+
+
+PAYMENTS_TASK = "Customers report failed card payments since this morning - find out why"
+
+
+def run_task(s, agent: str, task: str = PAYMENTS_TASK, approve: bool = True) -> dict:
+    """Submit a free-text task; if the plan needs approval, approve it (as the user would)."""
+    res = s.post(f"{PORTAL}/task", headers={"Accept": "application/json"}, data={"agent": agent, "task": task}).json()
+    if res.get("status") == "approval_required" and approve:
+        first = res
+        res = s.post(f"{PORTAL}/task/approve", headers={"Accept": "application/json"},
+                     data={"plan_id": first["plan"]["plan_id"], "decision": "approve"}).json()
+        res["approval"] = first
+    return res

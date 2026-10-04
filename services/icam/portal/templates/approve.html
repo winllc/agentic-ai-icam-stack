@@ -1,0 +1,22 @@
+{% extends "base.html" %}{% from "_macros.html" import step %}
+{% block body %}
+<p><a href="/">← back</a></p>
+<div class="card"><h2>Approve the agent's plan?</h2>
+<p class="small mute">Request: <b>{{ r.task }}</b> &middot; agent <code>{{ r.agent }}</code></p>
+<p>The agent wants to work on these systems. At least one is sensitive, so policy requires your approval
+before any token for it is issued.</p>
+<table><tr><th>System</th><th>Why the agent picked it</th><th>Needs approval</th></tr>
+{% for t in r.plan.targets %}<tr><td><code>{{ t }}</code></td><td>{{ r.plan.reasons.get(t, '') }}</td>
+<td>{% if t in r.plan.needs_approval %}<span class="deny">yes (PCI / mission-critical)</span>{% else %}no{% endif %}</td></tr>{% endfor %}
+</table>
+{% if r.plan.problems %}<p class="small mute">Policy adjustments: {{ r.plan.problems|join('; ') }}</p>{% endif %}
+<form method="post" action="/task/approve" style="margin-top:14px;display:flex;gap:10px">
+ <input type="hidden" name="plan_id" value="{{ r.plan.plan_id }}">
+ <button class="btn" name="decision" value="approve" type="submit">Approve plan</button>
+ <button class="btn ghost" name="decision" value="reject" type="submit">Reject</button>
+</form>
+<p class="small mute" style="margin-top:10px">If approved, the agent gets a token bound to exactly these systems
+(<code>authorization_details</code>); resources refuse any other system.</p>
+</div>
+<div class="card"><h2>Trace so far</h2>{% for s in user.login_steps %}{{ step(s) }}{% endfor %}{% for s in r.steps %}{{ step(s) }}{% endfor %}</div>
+{% endblock %}
