@@ -204,7 +204,11 @@ def bootstrap(api: Api):
 def configure_runtime_tls(api: Api):
     """Runtime HTTPS key pair issued by the enterprise TLS issuing CA (pki-init): valid for the browser
     (localhost) and containers (pingfederate), and stable across PingFederate re-creation."""
-    key_id = "runtime-tls"
+    # Key pair id derived from the certificate, so a re-issued certificate (pki-init) is imported
+    # and activated instead of PingFederate keeping a stale one.
+    pem = open(os.path.join(PKI_DIR, "pingfederate.crt"), "rb").read()
+    key_id = "runtime-tls-" + hashlib.sha256(x509.load_pem_x509_certificate(pem).public_bytes(
+        Encoding.DER)).hexdigest()[:12]
     if not any(k["id"] == key_id for k in api.get("/keyPairs/sslServer")["items"]):
         with open(os.path.join(PKI_DIR, "pingfederate.p12"), "rb") as f:
             api.call("POST", "/keyPairs/sslServer/import", {
@@ -571,6 +575,12 @@ def configure_all(api: Api, identity: WorkloadIdentity) -> str:
 
 def main():
     global POLICY_HASH
+    # The marker lives in a persistent volume: drop the previous run's, so "healthy" always
+    # means "configured by THIS run" (dependants like vault-config must not start early).
+    try:
+        os.remove(os.path.join(TRUST_DIR, "ready"))
+    except FileNotFoundError:
+        pass
     api = Api(admin_session())
     identity = WorkloadIdentity(workdir="/run/svid")
     identity.wait_for_svid()

@@ -138,12 +138,40 @@ def audit_device():
         log("audit device -> stdout (every request: who, which policy, which path)")
 
 
+def wait_for_jwks(url: str, ca: str | None, timeout: int = 600):
+    """Vault validates the JWKS URL when the config is written. Wait until the IdP serves keys
+    over TLS that chains to the trust anchor (PingFederate shows a default self-signed
+    certificate until pf-configurator has installed the enterprise one)."""
+    probe = requests.Session()
+    probe.trust_env = False
+    probe.verify = ca or True
+    end, last = time.time() + timeout, None
+    while time.time() < end:
+        try:
+            keys = probe.get(url, timeout=10).json().get("keys", [])
+            if keys:
+                log(f"IdP JWKS reachable ({len(keys)} keys) at {url}")
+                return
+            reason = "JWKS has no keys yet"
+        except requests.exceptions.SSLError as exc:
+            reason = (f"TLS not yet trusted ({exc.__class__.__name__}) - the IdP is probably still on its default "
+                      "certificate; waiting for pf-configurator")
+        except requests.RequestException as exc:
+            reason = f"not reachable ({exc.__class__.__name__})"
+        if reason != last:
+            log(f"waiting for IdP JWKS: {reason}")
+            last = reason
+        time.sleep(5)
+    raise SystemExit(f"IdP JWKS at {url} never became usable: {last}")
+
+
 def jwt_auth():
     if not mounted("auth", "jwt"):
         api("POST", "sys/auth/jwt", {"type": "jwt"})
     cfg = {"jwks_url": os.environ["IDP_JWKS_URL"], "bound_issuer": os.environ["IDP_ISSUER"]}
     if os.environ.get("IDP_TLS_CA"):
         cfg["jwks_ca_pem"] = open(os.environ["IDP_TLS_CA"]).read()
+    wait_for_jwks(cfg["jwks_url"], os.environ.get("IDP_TLS_CA"))
     api("POST", "auth/jwt/config", cfg)
     api("PUT", "sys/policies/acl/inventory-read", {"policy": """
 path "database/creds/inventory-reader" { capabilities = ["read"] }

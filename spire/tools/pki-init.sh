@@ -49,9 +49,11 @@ if [[ ! -f $E/root-ca.crt ]]; then
     -days 7300 -subj "/C=US/O=Agentic AI ICAM Demo/OU=Enterprise PKI/CN=Demo Enterprise Root CA" \
     -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign"
 fi
+# chains <cert> <untrusted-chain-or-empty>: does it still verify against the current root?
+chains() { openssl verify -CAfile $E/root-ca.crt ${2:+-untrusted $2} "$1" >/dev/null 2>&1; }
 issuing_ca() {   # issuing_ca <name> <CN>
   local n=$1 cn=$2
-  [[ -f $E/$n.crt ]] && return
+  if [[ -f $E/$n.crt ]] && chains $E/$n.crt; then return; fi
   echo "[pki-init] issuing $cn"
   openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-384 -nodes -keyout $E/$n.key -out $E/$n.csr \
     -subj "/C=US/O=Agentic AI ICAM Demo/OU=Enterprise PKI/CN=$cn"
@@ -63,6 +65,10 @@ issuing_ca() {   # issuing_ca <name> <CN>
 issuing_ca tls-issuing-ca "Demo Enterprise TLS Issuing CA"
 
 mkdir -p tls
+if [[ -f tls/pingfederate.crt ]] && ! chains tls/pingfederate.crt $E/tls-issuing-ca.crt; then
+  echo "[pki-init] PingFederate certificate does not chain to the current root (older volume) - re-issuing"
+  rm -f tls/pingfederate.p12 tls/pingfederate.crt tls/pingfederate.key
+fi
 if [[ ! -f tls/pingfederate.p12 ]]; then
   echo "[pki-init] issuing PingFederate server certificate (TLS issuing CA)"
   openssl req -newkey rsa:2048 -nodes -keyout tls/pingfederate.key -out tls/pingfederate.csr \
@@ -77,7 +83,7 @@ if [[ ! -f tls/pingfederate.p12 ]]; then
 fi
 server_cert() {   # server_cert <name> <SAN list> - issued by the TLS issuing CA, with chain
   local n=$1 san=$2
-  [[ -f tls/$n.crt ]] && return
+  if [[ -f tls/$n.crt ]] && chains tls/$n.crt $E/tls-issuing-ca.crt; then return; fi
   echo "[pki-init] issuing $n server certificate (TLS issuing CA)"
   openssl req -newkey rsa:2048 -nodes -keyout tls/$n.key -out tls/$n.csr -subj "/C=US/O=Agentic AI ICAM Demo/CN=$n"
   printf "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=$san\n" > tls/$n.ext
