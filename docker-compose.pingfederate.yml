@@ -75,6 +75,7 @@ services:
       - policy:/policy:ro
       - pf-trust:/pf-trust
       - spire-pki:/pki:ro
+      - ./config/directory-mapping.yaml:/config/directory-mapping.yaml:ro
     healthcheck:
       test: ["CMD", "test", "-f", "/pf-trust/ready"]
       interval: 5s
@@ -90,6 +91,17 @@ services:
       - policy:/policy:ro
     depends_on: !override
       <<: *after-configurator
+      vault-config:
+        condition: service_completed_successfully
+
+  vault-config:
+    environment:
+      IDP_JWKS_URL: https://pingfederate:9031/pf/JWKS
+      IDP_ISSUER: https://localhost:9031
+      IDP_TLS_CA: /pki/tls/trust-anchor.pem
+    depends_on:
+      pf-configurator:
+        condition: service_healthy
 
   analysis-agent: &agent-overrides
     environment:
@@ -101,6 +113,8 @@ services:
       - policy:/policy:ro
     depends_on: !override
       <<: *after-configurator
+      vault-config:
+        condition: service_completed_successfully
 
   remediation-agent: *agent-overrides
 

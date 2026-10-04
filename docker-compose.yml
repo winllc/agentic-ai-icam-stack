@@ -11,7 +11,8 @@
 #                                    JWT grant from PingFederate, redeemed over SPIFFE-federated mTLS
 #
 #   LDAP directory (people + agent NPEs) ─► directory-sync ─► SPIRE entries + effective IdP policy
-#   Enterprise root CA ─► SPIRE issuing CA ─► SPIRE CA ─► SVIDs   (one trust anchor)
+#   Enterprise root CA ─► SPIRE issuing CA (key in Vault) ─► SPIRE CA ─► SVIDs   (one trust anchor)
+#   Vault: SPIRE's upstream CA + dynamic database users for agents (delegated-token login)
 #
 # `docker compose up --build` then open http://localhost:8080 (alice/alice or bob/bob).
 
@@ -73,13 +74,51 @@ services:
       - partner-server-data:/partner-server-data
       - partner-server-socket:/partner-server-socket
 
-  spire-server:
-    image: ghcr.io/spiffe/spire-server:${SPIRE_VERSION:-1.13.3}
-    command: ["-config", "/opt/spire/conf/server/server.conf"]
+  # ------------------------------------------------------------------ Vault
+  vault:
+    image: hashicorp/vault:${VAULT_VERSION:-1.20}
+    command: ["server"]
     restart: unless-stopped
     depends_on:
       pki-init:
         condition: service_completed_successfully
+    environment:
+      VAULT_ADDR: https://vault:8200
+      VAULT_CACERT: /pki/tls/trust-anchor.pem
+    volumes:
+      - ./vault/vault.hcl:/vault/config/vault.hcl:ro
+      - spire-pki:/pki:ro
+      - vault-data:/vault/file
+    ports:
+      - "8200:8200"     # UI/API (TLS, enterprise root)
+    healthcheck:       # reachable (sealed or not); vault-init unseals it
+      test: ["CMD-SHELL", "vault status >/dev/null 2>&1; [ $$? -ne 1 ]"]
+      <<: *http-health
+
+  # Init/unseal + the SPIRE issuing CA inside Vault + SPIRE's AppRole (before SPIRE starts).
+  vault-init:
+    image: agentic-icam/services:latest
+    command: ["python", "-m", "icam.vaultsetup.setup", "pki"]
+    depends_on:
+      vault:
+        condition: service_healthy
+    environment:
+      VAULT_APPROLE_SECRET_ID: ${VAULT_APPROLE_SECRET_ID:-spire-approle-secret-demo}
+    volumes:
+      - spire-pki:/pki:ro
+      - vault-keys:/vault-keys
+
+  spire-server:
+    image: ghcr.io/spiffe/spire-server:${SPIRE_VERSION:-1.13.3}
+    command: ["-config", "/opt/spire/conf/server/server.conf", "-expandEnv"]
+    restart: unless-stopped
+    depends_on:
+      pki-init:
+        condition: service_completed_successfully
+      vault-init:
+        condition: service_completed_successfully
+    environment:
+      VAULT_APPROLE_SECRET_ID: ${VAULT_APPROLE_SECRET_ID:-spire-approle-secret-demo}
     volumes:
       - ./spire/server/server.conf:/opt/spire/conf/server/server.conf:ro
       - spire-pki:/opt/spire/pki:ro
@@ -199,6 +238,7 @@ services:
       SYNC_INTERVAL: "10"
     volumes:
       - ./config/idp-policy.yaml:/config/idp-policy.yaml:ro
+      - ./config/directory-mapping.yaml:/config/directory-mapping.yaml:ro
       - policy:/policy
       - spire-server-socket:/tmp/spire-server/private
     healthcheck:
@@ -224,12 +264,45 @@ services:
     volumes:
       - spire-agent-socket:/run/spire/sockets:ro
       - policy:/policy:ro
+      - ./config/directory-mapping.yaml:/config/directory-mapping.yaml:ro
     ports:
       - "9031:9031"   # browser + back channel
       - "9443:9443"   # mTLS token endpoint alias
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9031/healthz')"]
       <<: *http-health
+
+  # ------------------------------------------------------------------ Legacy system + Vault brokers
+  inventory-db:
+    image: postgres:${POSTGRES_VERSION:-16-alpine}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: inventory
+      POSTGRES_PASSWORD: ${INVENTORY_DB_SUPERUSER_PASSWORD:-postgres-demo}
+    volumes:
+      - ./inventory-db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - inventory-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "inventory"]
+      <<: *http-health
+
+  # JWT auth trusting the IdP + PostgreSQL dynamic credentials + audit (after the IdP is up).
+  vault-config:
+    image: agentic-icam/services:latest
+    command: ["python", "-m", "icam.vaultsetup.setup", "brokers"]
+    depends_on:
+      vault-init:
+        condition: service_completed_successfully
+      inventory-db:
+        condition: service_healthy
+      pingfederate:
+        condition: service_healthy
+    environment:
+      IDP_JWKS_URL: http://pingfederate:9031/pf/JWKS
+      IDP_ISSUER: http://localhost:9031
+    volumes:
+      - spire-pki:/pki:ro
+      - vault-keys:/vault-keys:ro
 
   # ------------------------------------------------------------------ Agentic AI Service
   agentic-ai-service:
@@ -272,6 +345,8 @@ services:
         condition: service_healthy
       directory-sync:
         condition: service_healthy
+      vault-config:
+        condition: service_completed_successfully
     volumes:
       - spire-agent-socket:/run/spire/sockets:ro
       - policy:/policy:ro
@@ -296,6 +371,8 @@ services:
         condition: service_healthy
       directory-sync:
         condition: service_healthy
+      vault-config:
+        condition: service_completed_successfully
     volumes:
       - spire-agent-socket:/run/spire/sockets:ro
       - policy:/policy:ro
@@ -375,3 +452,6 @@ volumes:
   partner-agent-socket:
   ldap-data:
   policy:
+  vault-data:
+  vault-keys:
+  inventory-data:

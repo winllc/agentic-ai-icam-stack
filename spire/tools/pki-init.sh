@@ -33,10 +33,12 @@ node_pki node docker-host            # trust domain demo.local
 node_pki partner-node partner-host   # trust domain partner.example (the external partner)
 
 # --- Demo enterprise PKI (stands in for an organisation's approved CA hierarchy) ---------
-#   Demo Enterprise Root CA
-#     ├─ Demo Enterprise SPIRE Issuing CA  -> SPIRE UpstreamAuthority: SPIRE's CA is chained
-#     │                                       below it, so SVIDs validate against the root
-#     └─ Demo Enterprise TLS Issuing CA    -> PingFederate's runtime HTTPS certificate
+#   Demo Enterprise Root CA        (offline in real life; its key signs only issuing CAs)
+#     ├─ Demo Enterprise SPIRE Issuing CA  -> key generated INSIDE Vault (pki_spire mount);
+#     │                                       vault-init signs Vault's CSR with this root.
+#     │                                       SPIRE's UpstreamAuthority "vault" chains SPIRE's
+#     │                                       CA below it, so SVIDs validate against the root.
+#     └─ Demo Enterprise TLS Issuing CA    -> PingFederate's and Vault's HTTPS certificates
 # One trust anchor (the root) for browsers, legacy systems, PingFederate and partners.
 mkdir -p enterprise
 E=enterprise
@@ -58,7 +60,6 @@ issuing_ca() {   # issuing_ca <name> <CN>
     -out $E/$n.crt -days 1825 -extfile $E/$n.ext
   rm -f $E/$n.csr $E/$n.ext
 }
-issuing_ca spire-issuing-ca "Demo Enterprise SPIRE Issuing CA"
 issuing_ca tls-issuing-ca "Demo Enterprise TLS Issuing CA"
 
 mkdir -p tls
@@ -74,11 +75,25 @@ if [[ ! -f tls/pingfederate.p12 ]]; then
     -name runtime-tls -out tls/pingfederate.p12 -passout pass:"${PF_TLS_P12_PASSWORD:-changeit}"
   rm -f tls/pingfederate.csr tls/pingfederate.ext
 fi
-cp $E/root-ca.crt tls/trust-anchor.pem                 # what clients of PingFederate trust
+server_cert() {   # server_cert <name> <SAN list> - issued by the TLS issuing CA, with chain
+  local n=$1 san=$2
+  [[ -f tls/$n.crt ]] && return
+  echo "[pki-init] issuing $n server certificate (TLS issuing CA)"
+  openssl req -newkey rsa:2048 -nodes -keyout tls/$n.key -out tls/$n.csr -subj "/C=US/O=Agentic AI ICAM Demo/CN=$n"
+  printf "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=$san\n" > tls/$n.ext
+  openssl x509 -req -in tls/$n.csr -CA $E/tls-issuing-ca.crt -CAkey $E/tls-issuing-ca.key -CAcreateserial \
+    -out tls/$n.crt -days 825 -extfile tls/$n.ext
+  cat tls/$n.crt $E/tls-issuing-ca.crt > tls/$n-fullchain.crt
+  rm -f tls/$n.csr tls/$n.ext
+}
+server_cert vault "DNS:vault,DNS:localhost"
+
+cp $E/root-ca.crt tls/trust-anchor.pem                 # what clients of PingFederate / Vault trust
 chmod 0644 $E/*.crt tls/*.crt tls/*.pem tls/pingfederate.p12
 chmod 0600 $E/*.key tls/pingfederate.key
-# SPIRE Server (uid 1000) signs its CA with the SPIRE issuing CA key.
-chown 1000:1000 $E/spire-issuing-ca.key && chmod 0400 $E/spire-issuing-ca.key
+# Vault (uid 100 in the official image) reads its TLS key.
+chown 100:1000 tls/vault.key && chmod 0440 tls/vault.key
+chmod 0644 tls/vault-fullchain.crt
 
 # spire-server runs as uid 1000 in the upstream image.
 chown -R 1000:1000 /spire-server-data /spire-server-socket \

@@ -62,7 +62,8 @@ CALL_WITH_OWN_SVID = """
 me = WorkloadIdentity(); me.fetch()
 r = requests.request(args.get('method', 'GET'), args['url'], data=args.get('data'), cert=me.client_cert,
                      verify=args.get('ca') or str(me.bundle_path), headers=args.get('headers', {}), timeout=10)
-print(json.dumps({'status': r.status_code, 'body': r.text[:300], 'www': r.headers.get('WWW-Authenticate'),
+print(json.dumps({'status': r.status_code, 'body': r.text if args.get('full') else r.text[:300],
+                  'www': r.headers.get('WWW-Authenticate'),
                   'me': me.info['spiffe_id']}))
 """
 
@@ -112,9 +113,25 @@ print(json.dumps({'status': r.status_code, 'www': r.headers.get('WWW-Authenticat
 """
 
 
-def exchange(service: str, **form) -> dict:
+VAULT_LOGIN = """
+me = WorkloadIdentity(); me.fetch()
+v = requests.Session(); v.verify = str(me.bundle_path)
+r = v.post('https://vault:8200/v1/auth/jwt/login', json={'role': 'agent-inventory', 'jwt': args['jwt']})
+out = {'status': r.status_code, 'body': r.text[:240]}
+if r.ok and args.get('then'):
+    v.headers['X-Vault-Token'] = r.json()['auth']['client_token']
+    t = v.get('https://vault:8200/v1/' + args['then'])
+    out.update(then_status=t.status_code, then_body=t.text[:200])
+    if t.ok and 'lease_id' in t.json():
+        v.put('https://vault:8200/v1/sys/leases/revoke', json={'lease_id': t.json()['lease_id']})
+    v.post('https://vault:8200/v1/auth/token/revoke-self')
+print(json.dumps(out))
+"""
+
+
+def exchange(service: str, full: bool = False, **form) -> dict:
     return in_container(service, CALL_WITH_OWN_SVID, method="POST", url=stack.mtls_token_endpoint,
-                        ca=stack.container_ca, data=form)
+                        ca=stack.container_ca, data=form, full=full)
 
 
 def main() -> int:
@@ -206,6 +223,41 @@ def main() -> int:
     out = in_container("analysis-agent", PARTNER_CALL, token=g2.get("partner_token") or "")
     checks.append(("Control: partner token used by the agent it was issued to", out.get("status") == 200, out))
 
+    # --- Vault (credential broker for the legacy inventory database) --------------------
+    # 17. The user's own access token (aud = agentic-ai-service) presented to Vault.
+    out = in_container("analysis-agent", VAULT_LOGIN, jwt=alice)
+    checks.append(("User token used to log in to Vault (audience)", out.get("status") in (400, 403), out))
+
+    # 18. A delegated token minted only for the REST/MCP resources (no Vault audience).
+    narrow = exchange("analysis-agent", full=True, **{**te, "client_id": "analysis-agent", "scope": "systems:read",
+                                                      "resource": RESOURCES[:1]})
+    narrow_tok = json.loads(narrow.get("body") or "{}").get("access_token", "") if narrow.get("status") == 200 else ""
+    out = in_container("analysis-agent", VAULT_LOGIN, jwt=narrow_tok)
+    checks.append(("Delegated token without Vault in its audience", bool(narrow_tok) and out.get("status") in (400, 403),
+                   out))
+
+    # 19. A Vault token from the agent role cannot reach anything but its one credential path.
+    vault_tok = exchange("analysis-agent", full=True, **{**te, "client_id": "analysis-agent", "scope": "systems:read",
+                                                         "resource": [RESOURCES[0], "https://vault:8200"]})
+    vjwt = json.loads(vault_tok.get("body") or "{}").get("access_token", "") if vault_tok.get("status") == 200 else ""
+    out = in_container("analysis-agent", VAULT_LOGIN, jwt=vjwt, then="pki_spire/issuers")
+    checks.append(("Agent's Vault token used outside its policy (least privilege)",
+                   out.get("status") == 200 and out.get("then_status") == 403, out))
+
+    # 20. No standing database credential survives: every dynamic user is gone after the agents ran.
+    users = subprocess.run(["docker", "exec", "agentic-icam-inventory-db-1", "psql", "-U", "postgres", "-d", "inventory",
+                            "-tAc", "SELECT count(*) FROM pg_roles WHERE rolname LIKE 'v-jwt-%'"],
+                           capture_output=True, text=True).stdout.strip()
+    checks.append(("No standing database users left behind (revoke-self)", users == "0", f"dynamic users present: {users}"))
+
+    # Known gap (reported, not counted): Vault's JWT auth cannot check cnf, so a delegated token
+    # lifted from analysis-agent can be redeemed at Vault by another workload while it is valid.
+    gap = in_container("remediation-agent", VAULT_LOGIN, jwt=vjwt, then="database/creds/inventory-reader")
+    known_gaps = [("Delegated token replayed at Vault by a different workload",
+                   gap.get("then_status") == 200,
+                   "Vault JWT auth has no RFC 8705 cnf check - closing this needs a custom Vault auth "
+                   "plugin (JWT + mTLS binding) or a broker in front of Vault")]
+
     # 9. Positive control: the legitimate agent with the legitimate token works.
     legit = in_container("analysis-agent", CALL_WITH_OWN_SVID, url="https://systems-api:8443/systems/payments-api",
                          headers={"Authorization": f"Bearer {stolen}"})
@@ -217,6 +269,9 @@ def main() -> int:
         print(f"{'PASS' if ok else 'FAIL'}  {name}")
         brief = detail if isinstance(detail, str) else (detail.get("www") or detail.get("body") or detail.get("error"))
         print(f"        {str(brief)[:170]}")
+    for name, open_gap, why in known_gaps:
+        print(f"{'GAP ' if open_gap else 'OK  '}  {name}")
+        print(f"        {why if open_gap else 'not reproducible here'}")
     print("\nall security checks passed" if not failed else f"\n{failed} check(s) failed")
     return 1 if failed else 0
 

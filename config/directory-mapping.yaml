@@ -1,0 +1,37 @@
+# Where people and agents live in the directory, and what their attributes are called.
+# The demo maps its own OpenLDAP; point this at a RadiantLogic FID (RadiantOne) view, Active
+# Directory, or any LDAP v3 endpoint by editing DNs, filters and attribute names - no code changes.
+# Read by directory-sync, the PingFederate simulator and pf-configurator (PingFederate's LDAP
+# data store, password validator and attribute source).
+#
+# Example for an FID virtual view (illustrative names):
+#   people:  base: ou=people,o=identityview      filter: (&(objectClass=vdPerson)(uid={uid}))
+#   agents:  base: ou=agents,o=identityview      filter: (&(objectClass=vdAgent)(rlStatus=*))
+#   attributes: map e.g. spiffe_id: rlAgentSpiffeId, sponsor: rlOwnerDn, status: rlLifecycleState
+
+people:
+  base: ou=people,dc=demo,dc=local
+  filter: (uid={uid})                 # {uid} = the username typed at login
+  attributes:
+    uid: uid
+    name: displayName
+    email: mail
+    groups: employeeType              # multi-valued
+    entitlements: icamEntitlement     # multi-valued: scopes the person may delegate
+
+agents:
+  base: ou=agents,dc=demo,dc=local
+  filter: (objectClass=icamAgent)
+  active_values: [active]             # lifecycle values that mean "active" (case-insensitive)
+  attributes:
+    name: cn                          # becomes the OAuth client_id
+    description: description
+    sponsor: icamSponsor              # DN of the accountable person
+    spiffe_id: icamSpiffeId
+    selectors: icamWorkloadSelector   # multi-valued SPIRE selectors (type:value)
+    ceiling: icamScopeCeiling         # multi-valued
+    resources: icamAllowedResource    # multi-valued
+    federates_with: icamFederatesWith # multi-valued trust domains
+    status: icamLifecycleStatus
+    expires: icamExpires              # LDAP GeneralizedTime
+    last_recertified: icamLastRecertified

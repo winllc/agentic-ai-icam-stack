@@ -7,7 +7,7 @@ same file the simulator reads. Nothing is configured by hand.
 
 Tested end to end on PingFederate 13.1.3 with a development license.
 `scripts/smoke_test.py` passes 4/4 (steps 1–14, including the cross-domain call to
-`partner.example`), `scripts/security_checks.py` passes 16/16 and `scripts/governance_checks.py` 6/6. A
+`partner.example`), `scripts/security_checks.py` passes 20/20 (plus one reported Vault GAP) and `scripts/governance_checks.py` 7/7. A
 forced SPIRE CA rotation and a re-created PingFederate container both recover
 automatically.
 
@@ -35,6 +35,7 @@ python3 scripts/smoke_test.py && python3 scripts/security_checks.py
 | first start | accepts the license agreement, creates the initial administrator |
 | `scopes` | OAuth common scopes. `disallowPlainPKCE` is set. |
 | people | **LDAP data store** `directory` (`cn=idp` service account) → **LDAP Username Password Credential Validator** (`uid=${username}` under `ou=people`) → HTML Form IdP Adapter → IdP adapter grant mapping |
+| directory layout | Base DN, filters and attribute names come from `config/directory-mapping.yaml`, the same file `directory-sync` and the simulator use. Point it at a RadiantLogic FID view or AD. |
 | user `entitlements`, `name`, `email`, `groups` | **LDAP attribute source** on the user-token mapping (`uid=${USER_KEY}`). Read at issuance; multi-valued `icamEntitlement` joined with OGNL `#this.get("ds.people.icamEntitlement")`. |
 | user access token | JWT ATM `useratm`: RS256 with the central signing key (`/pf/JWKS`), `iss=https://localhost:9031`, `aud=agentic-ai-service` |
 | ID token | OIDC policy `portaloidc` (`sub`, `name`, `email`, `groups`) |

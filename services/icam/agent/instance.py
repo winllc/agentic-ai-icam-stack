@@ -35,6 +35,7 @@ PF_INTERNAL_BASE = os.environ.get("PF_INTERNAL_BASE", "").rstrip("/")
 PF_TLS_CA = os.environ.get("PF_TLS_CA")  # None -> trust the SPIFFE bundle (demo AS is a SPIFFE workload)
 SYSTEMS_API = os.environ.get("SYSTEMS_API_URL", "https://systems-api:8443")
 OPS_MCP = os.environ.get("OPS_MCP_URL", "https://ops-mcp:8443/mcp")
+VAULT = os.environ.get("VAULT_ADDR", "https://vault:8200")   # credential broker for legacy systems
 TASK_SCOPES = os.environ.get("TASK_SCOPES",
                              "systems:read systems:analyze metrics:read tickets:read tickets:write")
 AGENT_POLICY = os.environ.get("AGENT_POLICY", "/config/idp-policy.yaml")
@@ -42,11 +43,15 @@ AGENT_POLICY = os.environ.get("AGENT_POLICY", "/config/idp-policy.yaml")
 EGRESS_SCOPES = os.environ.get("EGRESS_SCOPES", "partner:status.read partner:cases.write")
 
 
-def agent_ceiling() -> set[str]:
-    """The scopes this agent's OAuth client is registered for (its "manifest")."""
+def agent_client() -> dict:
+    """This agent's OAuth client as rendered from the directory (its "manifest")."""
     import yaml
     with open(AGENT_POLICY) as f:
-        return set(yaml.safe_load(f)["clients"][AGENT_NAME]["allowed_scopes"])
+        return yaml.safe_load(f)["clients"][AGENT_NAME]
+
+
+def agent_ceiling() -> set[str]:
+    return set(agent_client()["allowed_scopes"])
 
 
 def user_scopes(claims: dict) -> set[str]:
@@ -109,6 +114,8 @@ def run(job: dict) -> dict:
     token_ep = os.environ.get("PF_MTLS_TOKEN_ENDPOINT") or backchannel(
         disco.get("mtls_endpoint_aliases", {}).get("token_endpoint") or disco["token_endpoint"])
     resources = [SYSTEMS_API, OPS_MCP]
+    if VAULT in agent_client().get("allowed_resources", []):
+        resources.append(VAULT)        # the same delegated token logs in to Vault (aud contains it)
     # The AS rejects (never narrows) a request outside User ∩ Agent, so ask for exactly that.
     user_claims = unverified_claims(job["user_token"])
     user_set, agent_set, task_set = user_scopes(user_claims), agent_ceiling(), set(TASK_SCOPES.split())
@@ -174,6 +181,8 @@ def run(job: dict) -> dict:
     rest("GET", f"/systems/{system}", "systems:read", "system")
     rest("GET", f"/systems/{system}/metrics", "metrics:read", "metrics")
     rest("POST", f"/systems/{system}/diagnostics", "systems:analyze", "diagnostics")
+    if VAULT in resources:
+        legacy_inventory(identity, delegated, system, calls, data)
 
     mcp_ids = iter(range(1, 100))
     mcp_headers = {"Accept": "application/json, text/event-stream", "MCP-Protocol-Version": "2025-06-18"}
@@ -218,6 +227,48 @@ def run(job: dict) -> dict:
     result["summary"] = summarize(job["task"], system, data, findings, calls)
     result["steps"] = trace.steps
     return result
+
+
+def legacy_inventory(identity, delegated, system, calls, data):
+    """A legacy system that only understands database users: Vault turns the delegated token
+    into a 5-minute PostgreSQL user, which the agent drops as soon as it is done."""
+    vault = requests.Session()
+    vault.trust_env = False
+    vault.verify = str(identity.bundle_path)        # Vault's TLS chains to the same enterprise root
+
+    def note(op, resp, scope="systems:read"):
+        calls.append({"kind": "VAULT", "operation": op, "scope": scope, "http_status": resp.status_code,
+                      "outcome": "allowed" if resp.ok else resp.text[:200]})
+
+    r = vault.post(f"{VAULT}/v1/auth/jwt/login", json={"role": "agent-inventory", "jwt": delegated}, timeout=10)
+    note("login auth/jwt role=agent-inventory (delegated token)", r)
+    if not r.ok:
+        return
+    auth = r.json()["auth"]
+    vault.headers["X-Vault-Token"] = auth["client_token"]
+    r = vault.get(f"{VAULT}/v1/database/creds/inventory-reader", timeout=10)
+    note("read database/creds/inventory-reader", r)
+    if not r.ok:
+        return
+    creds, lease = r.json()["data"], r.json()["lease_duration"]
+    import psycopg
+    try:
+        with psycopg.connect(host="inventory-db", dbname="inventory", user=creds["username"],
+                             password=creds["password"], connect_timeout=5) as db:
+            row = db.execute("SELECT owner, cost_center, criticality, data_classification, last_dr_test "
+                             "FROM assets WHERE system = %s", (system,)).fetchone()
+        calls.append({"kind": "SQL", "operation": f"SELECT assets AS {creds['username'][:26]}... (lease {lease}s)",
+                      "scope": "systems:read", "http_status": 200, "outcome": "allowed"})
+        if row:
+            data["inventory"] = dict(zip(("owner", "cost_center", "criticality", "data_classification",
+                                          "last_dr_test"), map(str, row)),
+                                     vault_identity={"user": auth["metadata"].get("sub") or auth.get("entity_id"),
+                                                     **auth["metadata"]})
+    except Exception as exc:
+        calls.append({"kind": "SQL", "operation": "SELECT assets", "scope": "systems:read", "http_status": 500,
+                      "outcome": str(exc)[:200]})
+    r = vault.post(f"{VAULT}/v1/auth/token/revoke-self", timeout=10)
+    note("revoke-self (drops the database user now, not in 5 min)", r)
 
 
 def federate(trace, identity, job, token_ep, data, findings, user_set, agent_set):

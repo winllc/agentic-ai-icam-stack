@@ -51,7 +51,8 @@ def main() -> int:
             ok &= claims.get("act", {}).get("sub") == f"spiffe://demo.local/agent/{agent}"
             ok &= "x5t#S256" in claims.get("cnf", {})
             for c in calls:   # every resource decision must match the delegated scope
-                ok &= (c["http_status"] in (200, 202)) == (c["scope"] in granted)
+                ok &= (200 <= c["http_status"] < 300) == (c["scope"] in granted)
+            ok &= {"VAULT", "SQL"} <= {c["kind"] for c in calls}     # legacy DB via a Vault dynamic user
             failures += not ok
             print(f"{'PASS' if ok else 'FAIL'}  {user:5} + {agent:17} -> {' '.join(sorted(granted)) or res.get('error')}")
             for c in calls + pcalls:

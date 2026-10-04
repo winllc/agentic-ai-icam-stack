@@ -11,7 +11,9 @@ resources over mTLS. It can also call an **external partner's API in another tru
 It follows a **hybrid identity model**. An LDAP directory is the system of record: people carry
 their entitlements there, and agents are governed non-person entities with a sponsor, lifecycle,
 expiry, recertification date and scope ceiling. SPIRE issues the short-lived runtime credentials,
-and its CA is chained to an enterprise PKI root, so SVIDs validate in ordinary trust stores.
+and its CA is chained to an enterprise PKI root through **HashiCorp Vault**, so SVIDs validate in
+ordinary trust stores. Vault also brokers short-lived database users for a legacy system,
+using the agent's delegated token.
 
 ```
 User ─1─► Agentic AI Service ─2 OIDC+PKCE─► PingFederate ─3 tokens─► Agentic AI Service
@@ -52,8 +54,8 @@ To check everything from the command line (needs `pip install requests`). Both s
 
 ```bash
 python3 scripts/smoke_test.py        # browser flow, 2 users × 2 agents, steps 1-14, scope intersections + cnf/act
-python3 scripts/security_checks.py   # 14 attacks/policy violations that must fail + 2 positive controls
-python3 scripts/governance_checks.py # directory-driven lifecycle: disable, expire, narrow, revoke (~3 min)
+python3 scripts/security_checks.py   # 18 attacks/violations that must fail + 2 controls, plus known GAPs
+python3 scripts/governance_checks.py # directory mapping, legacy trust, disable/expire/narrow/revoke (~3 min)
 ```
 
 Stop with `docker compose down` (add the same `-f` files in mode B). Add `-v` to wipe all state.
@@ -81,6 +83,9 @@ model only sees data the delegated token allowed the agent to read.
 | `spire-agent` | SPIRE Agent: Workload API socket, docker workload attestor | internal |
 | `systems-api` | Enterprise REST API (inventory, metrics, diagnostics) | internal `8443` mTLS |
 | `ops-mcp` | Enterprise MCP server (runbooks, tickets), Streamable HTTP, OAuth per tool | internal `8443` mTLS |
+| `vault` | HashiCorp Vault: SPIRE's upstream CA (`pki_spire`) and dynamic PostgreSQL users (JWT auth with delegated tokens). Audit to stdout. | `localhost:8200` (TLS) |
+| `vault-init`, `vault-config` | One-shot Vault setup: init/unseal, issuing CA, AppRole (before SPIRE); JWT auth, database role, audit (after the IdP) | – |
+| `inventory-db` | A legacy PostgreSQL inventory that understands only database users | internal `5432` |
 | `ldap` | OpenLDAP directory (`dc=demo,dc=local`): people with `icamEntitlement`, agents as `icamAgent` non-person entities. Custom schema in `directory/icam.schema`. | internal `389` |
 | `directory-sync` | Directory → runtime every 10 s: SPIRE entries for active agents (revokes the rest) and the effective IdP policy | – |
 | `pki-init`, `spire-register` | One-shot jobs: node-attestation PKI (both domains), demo enterprise PKI (root, SPIRE and TLS issuing CAs), SPIFFE federation bootstrap, infrastructure registration entries | – |
@@ -147,7 +152,7 @@ and steps 10 and 14 show each call's allow/deny decision.
                    expiry, recertified, ceiling,                     └──► OAuth clients (enabled, ceiling)
                    selectors, allowed resources)
 
- Demo Enterprise Root CA ─┬─ SPIRE Issuing CA ── SPIRE CA (rotates) ── X.509-SVIDs (1 h)
+ Demo Enterprise Root CA ─┬─ SPIRE Issuing CA (key in Vault) ── SPIRE CA (rotates) ── X.509-SVIDs (1 h)
                           └─ TLS Issuing CA ──── PingFederate HTTPS
 ```
 
@@ -173,6 +178,46 @@ printf 'dn: cn=remediation-agent,ou=agents,dc=demo,dc=local\nchangetype: modify\
   | docker compose exec -T ldap ldapmodify -x -H ldap://localhost -D cn=admin,dc=demo,dc=local -w admin
 docker compose logs directory-sync | tail -3   # "SPIRE: revoked spiffe://demo.local/agent/remediation-agent (...)"
 ```
+
+## Vault: SPIRE's issuing CA and a credential broker for legacy systems
+
+```
+ Enterprise root (pki-init) ──signs CSR──► Vault pki_spire: "Demo Enterprise SPIRE Issuing CA" (key never leaves Vault)
+                                              ▲ AppRole spire-server (may only call root/sign-intermediate)
+ SPIRE Server ── UpstreamAuthority "vault" ───┘ at every SPIRE CA rotation
+
+ Agent ── delegated token (aud includes https://vault:8200) ──► Vault auth/jwt role agent-inventory
+          (bound: act.sub = demo.local agent, scope contains systems:read; entity = the user)
+       ◄── 5-minute PostgreSQL user  v-jwt-<user>-inventor-…  (SELECT on assets only)
+       ── SQL ──► inventory-db (legacy: understands database users, not OAuth)
+       ── revoke-self ──► Vault drops the database user immediately
+```
+
+- **No standing secrets:** the agent never holds a database password beyond one task, and the
+  database user is named after the *end user*, so the database's own logs show on whose behalf it acted.
+- **Same governance:** Vault is just another resource. The directory decides whether an agent
+  may use it (`icamAllowedResource: https://vault:8200`), and the delegated scope decides what it gets.
+- **Audit:** Vault's audit device (stdout of `vault`) records user, agent (`act.sub`), policy and path.
+- **Known gap (`security_checks.py` reports it as `GAP`):** Vault's JWT auth can't check `cnf`, so a
+  delegated token lifted from one agent can be redeemed at Vault by another workload during its
+  5-minute life. Closing it needs a custom Vault auth plugin that binds JWT and mTLS, or a broker
+  in front of Vault. That's one of the custom-software items below.
+
+## Mapping to a customer estate (SailPoint IIQ, RadiantLogic FID, PingFederate, Vault)
+
+| Demo component | Customer product | Notes |
+|---|---|---|
+| OpenLDAP `ou=people`, `ou=agents` | **RadiantLogic FID** view | Point `config/directory-mapping.yaml` at the FID view: base DNs, filters, attribute names. Users are found by search and then bound, so no DN layout is assumed. `governance_checks.py` verifies an FID-style mapping (compound filters, no schema) gives identical results. |
+| Lifecycle edits (`ldapmodify` in the checks) | **SailPoint IIQ** | Agents as a non-human identity type with owner = sponsor, certifications, and a leaver rule suspending owned agents. IIQ provisions `status`, `expires`, `ceiling` and `selectors` to the directory/FID. |
+| `pf-configurator` | **PingFederate** | Config-as-code. The OGNL policy expressions should become a supported PingFederate SDK plugin. |
+| Vault (`vault`, `vault-init`, `vault-config`) | **HashiCorp Vault** | As here: PKI mount as SPIRE's upstream CA (HSM-backed keys in Enterprise), JWT auth for delegated tokens, database secrets engine. |
+| SPIRE | (new platform) | The only component they don't already run. |
+
+Custom software still worth building on that estate: the IIQ → FID → SPIRE/PingFederate/Vault
+**event-driven reconciler** (`directory-sync` is the prototype; FID can push changes instead of
+polling); a **PingFederate plugin** replacing the OGNL; a **Vault auth plugin or broker** with
+certificate binding (the `GAP` above); an **MCP/egress gateway**; and **audit correlation**
+across PingFederate, Vault, SPIRE and IIQ.
 
 ## The policy
 
@@ -222,6 +267,8 @@ agent only gets what the task asked for.
 docker-compose.yml               the stack
 docker-compose.pingfederate.yml  overlay: real PingFederate 13.1 instead of the simulator
 config/idp-policy.yaml           base policy: scopes, portal client, agent-client template, federation
+config/directory-mapping.yaml    where people/agents live in the directory + attribute names (FID, AD, ...)
+vault/vault.hcl, inventory-db/   Vault server config; the legacy inventory database
 directory/                       OpenLDAP image: icam schema, ACLs, seed (people + agent NPEs)
 config/partner-policy.yaml       the external partner's own policy
 spire/                           server/agent config (demo.local + partner/), PKI, federation + registration
@@ -233,7 +280,8 @@ services/icam/
   agent/                         runtime (per-task process) + agent instance
   resources/                     systems-api (REST) and ops-mcp (MCP)
   partner/                       the external partner: authorization server + API
-  directory/                     LDAP access + directory-sync (SPIRE entries, effective policy)
+  directory/                     LDAP access (mapping-driven) + directory-sync (SPIRE entries, effective policy)
+  vaultsetup/                    Vault init/unseal, SPIRE issuing CA, AppRole, JWT auth, database role
 scripts/                         smoke, security and governance checks (both modes)
 pingfederate/                    real-PingFederate guide; license/ (git-ignored)
 ```
@@ -249,9 +297,10 @@ pingfederate/                    real-PingFederate guide; license/ (git-ignored)
 - Werkzeug's development server serves the Python services.
 - Demo passwords and service-account secrets: `.env.example`, `directory/seed.ldif`. The client
   secret and pairwise salt are in `config/idp-policy.yaml`.
-- LDAP runs without TLS (`ldap://`) on the internal network, and the enterprise PKI keys are files.
-  In production use LDAPS and keep CA keys in an HSM. SPIRE supports HSM-backed and cloud-KMS
-  upstream authorities.
+- LDAP runs without TLS (`ldap://`) on the internal network (set `LDAP_TLS_CA` with an `ldaps://`
+  URL for LDAPS). The enterprise root key is a file; real roots are offline in an HSM.
+- Vault uses one unseal key stored in the `vault-keys` volume and file storage. In production use
+  Raft storage, auto-unseal (HSM/KMS) and no persisted root token.
 - `directory-sync` polls every 10 s. A production version would use persistent search or a change
   log, and the IGA tool would write lifecycle changes.
 - Both trust domains run on one Docker host and network. A real partner would be reachable only

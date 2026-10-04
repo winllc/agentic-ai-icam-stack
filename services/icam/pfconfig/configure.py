@@ -237,7 +237,11 @@ def configure_scopes(api: Api):
     log.info("scopes: %s", sorted(s["name"] for s in settings["scopes"]))
 
 
-PEOPLE_BASE = os.environ.get("LDAP_PEOPLE_BASE", "ou=people,dc=demo,dc=local")
+# Directory layout + attribute names (same mapping as directory-sync and the simulator).
+DIRECTORY = yaml.safe_load(open(os.environ.get("DIRECTORY_MAPPING", "/config/directory-mapping.yaml")))
+PEOPLE = DIRECTORY["people"]
+PEOPLE_BASE = PEOPLE["base"]
+PEOPLE_ATTR = PEOPLE["attributes"]
 
 
 def configure_authentication(api: Api):
@@ -254,7 +258,12 @@ def configure_authentication(api: Api):
         "pluginDescriptorRef": ref("org.sourceid.saml20.domain.LDAPUsernamePasswordCredentialValidator"),
         "configuration": {"tables": [{"name": "Authentication Error Overrides", "rows": []}],
                           "fields": fields(**{"LDAP Datastore": "directory", "Search Base": PEOPLE_BASE,
-                                              "Search Filter": "uid=${username}", "Scope of Search": "Subtree",
+                                              "Search Filter": PEOPLE["filter"].strip("()").replace("{uid}", "${username}")
+                                              if PEOPLE["filter"].count("(") == 1
+                                              else PEOPLE["filter"].replace("{uid}", "${username}"),
+                                              "Scope of Search": "Subtree",
+                                              "Display Name Attribute": PEOPLE_ATTR["name"],
+                                              "Mail Attribute": PEOPLE_ATTR["email"],
                                               "Case-Sensitive Matching": "false"})},
         "attributeContract": {"coreAttributes": [{"name": n} for n in ("DN", "givenName", "mail", "username")]},
     })
@@ -318,16 +327,16 @@ def configure_user_tokens(api: Api):
         "attributeSources": [{
             "type": "LDAP", "id": "people", "description": "Person entry in the directory",
             "dataStoreRef": ref("directory"), "baseDn": PEOPLE_BASE, "searchScope": "SUBTREE",
-            "searchFilter": "uid=${USER_KEY}",
-            "searchAttributes": ["displayName", "mail", "employeeType", "icamEntitlement"],
+            "searchFilter": PEOPLE["filter"].replace("{uid}", "${USER_KEY}"),
+            "searchAttributes": [PEOPLE_ATTR[k] for k in ("name", "email", "groups", "entitlements")],
         }],
         "attributeContractFulfillment": {
             "sub": val("OAUTH_PERSISTENT_GRANT", "USER_KEY"),
-            "name": val("LDAP_DATA_STORE", "displayName", "people"),
-            "email": val("LDAP_DATA_STORE", "mail", "people"),
-            "groups": val("EXPRESSION", from_ldap("employeeType")),
-            # The user's entitlements = the scopes this user may ever delegate (LDAP icamEntitlement).
-            "entitlements": val("EXPRESSION", from_ldap("icamEntitlement")),
+            "name": val("LDAP_DATA_STORE", PEOPLE_ATTR["name"], "people"),
+            "email": val("LDAP_DATA_STORE", PEOPLE_ATTR["email"], "people"),
+            "groups": val("EXPRESSION", from_ldap(PEOPLE_ATTR["groups"])),
+            # The user's entitlements = the scopes this user may ever delegate (directory attribute).
+            "entitlements": val("EXPRESSION", from_ldap(PEOPLE_ATTR["entitlements"])),
         },
     })
     api.upsert("/oauth/openIdConnect/policies", {

@@ -78,6 +78,7 @@ icamScopeCeiling: tickets:read
 icamScopeCeiling: partner:status.read
 icamAllowedResource: https://systems-api:8443
 icamAllowedResource: https://ops-mcp:8443/mcp
+icamAllowedResource: https://vault:8200
 icamAllowedResource: https://partner-as:8443
 icamFederatesWith: partner.example
 icamLifecycleStatus: active
@@ -99,6 +100,7 @@ icamScopeCeiling: partner:status.read
 icamScopeCeiling: partner:cases.write
 icamAllowedResource: https://systems-api:8443
 icamAllowedResource: https://ops-mcp:8443/mcp
+icamAllowedResource: https://vault:8200
 icamAllowedResource: https://partner-as:8443
 icamFederatesWith: partner.example
 icamLifecycleStatus: active

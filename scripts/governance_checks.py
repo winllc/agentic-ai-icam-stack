@@ -103,7 +103,38 @@ def user_token(user: str) -> str:
                                    "partner:status.read partner:cases.write")
 
 
+MAPPING_PORTABILITY = """
+import copy, json
+from ldap3 import Server
+from icam.directory.ldapdir import Directory, load_mapping, _time
+base = load_mapping()
+alt = copy.deepcopy(base)       # an FID-style view: compound filters, schema-less server
+alt['people']['filter'] = '(&(objectClass=inetOrgPerson)(|(uid={uid})(mail={uid})))'   # login by uid OR email
+alt['agents']['filter'] = '(&(objectClass=applicationProcess)(icamSpiffeId=*))'
+alt['agents']['active_values'] = ['ACTIVE', 'enabled']
+a, b = Directory(mapping=base), Directory(mapping=alt)
+b.server = Server(a.server.host, port=a.server.port, get_info='NO_INFO', connect_timeout=5)
+strip = lambda xs: [{k: v for k, v in x.items()} for x in xs]
+print(json.dumps({
+    'agents_equal': strip(a.agents()) == strip(b.agents()),
+    'login_by_mail': (b.authenticate('alice@demo.local', 'alice') or {}).get('uid'),
+    'bad_password': b.authenticate('alice', 'nope'),
+    'empty_password': b.authenticate('alice', ''),
+    'string_time': str(_time('20271231235959Z')),
+}))
+"""
+
+
 # ------------------------------------------------------------------ checks
+def check_mapping_portability():
+    """The directory code is layout-agnostic: an FID-style mapping (compound filters, no schema) gives the same view."""
+    out = json.loads(sh("docker", "exec", "agentic-icam-directory-sync-1", "python", "-c",
+                        MAPPING_PORTABILITY).strip().splitlines()[-1])
+    ok = (out["agents_equal"] and out["login_by_mail"] == "alice" and out["bad_password"] is None
+          and out["empty_password"] is None and out["string_time"].startswith("2027-12-31 23:59:59"))
+    return ok, out
+
+
 def check_parity():
     """Every active directory agent has a SPIRE entry and an enabled OAuth client, with the LDAP ceiling."""
     ids = spire_agent_ids()
@@ -222,7 +253,7 @@ def check_entitlement_change():
 def main() -> int:
     print(f"identity provider: {stack.name}\n")
     failed = 0
-    for check in (check_parity, check_legacy_trust, check_entitlement_change, check_ceiling_change,
+    for check in (check_parity, check_mapping_portability, check_legacy_trust, check_entitlement_change, check_ceiling_change,
                   check_expiry, check_disable_revokes):
         try:
             ok, detail = check()
