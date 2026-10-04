@@ -10,6 +10,9 @@
 #                                 └─(identity chaining)────► partner.example: Partner AS ─► Partner API
 #                                    JWT grant from PingFederate, redeemed over SPIFFE-federated mTLS
 #
+#   LDAP directory (people + agent NPEs) ─► directory-sync ─► SPIRE entries + effective IdP policy
+#   Enterprise root CA ─► SPIRE issuing CA ─► SPIRE CA ─► SVIDs   (one trust anchor)
+#
 # `docker compose up --build` then open http://localhost:8080 (alice/alice or bob/bob).
 
 name: agentic-icam
@@ -25,6 +28,11 @@ x-python-service: &python-service
       condition: service_healthy
   volumes:
     - spire-agent-socket:/run/spire/sockets:ro
+
+x-ldap-idp-env: &ldap-idp-env
+  LDAP_URL: ldap://ldap:389
+  LDAP_BIND_DN: cn=idp,ou=services,dc=demo,dc=local
+  LDAP_BIND_PASSWORD: ${LDAP_IDP_PASSWORD:-idp-secret}
 
 x-python-env: &python-env
   SPIFFE_ENDPOINT_SOCKET: unix:///run/spire/sockets/agent.sock
@@ -153,20 +161,69 @@ services:
       test: ["CMD", "/opt/spire/bin/spire-agent", "healthcheck", "-socketPath", "/run/spire/sockets/agent.sock"]
       <<: *http-health
 
+  # ------------------------------------------------------------------ Directory (system of record)
+  ldap:
+    build: ./directory
+    image: agentic-icam/ldap:latest
+    restart: unless-stopped
+    environment:
+      LDAP_ADMIN_PASSWORD: ${LDAP_ADMIN_PASSWORD:-admin}
+      LDAP_SYNC_PASSWORD: ${LDAP_SYNC_PASSWORD:-sync-secret}
+      LDAP_IDP_PASSWORD: ${LDAP_IDP_PASSWORD:-idp-secret}
+    volumes:
+      - ldap-data:/var/lib/openldap/data
+    healthcheck:
+      test: ["CMD", "ldapwhoami", "-x", "-H", "ldap://localhost", "-D", "cn=idp,ou=services,dc=demo,dc=local",
+             "-w", "${LDAP_IDP_PASSWORD:-idp-secret}"]
+      <<: *http-health
+
+  # Directory -> runtime: SPIRE registration entries for agents + the effective IdP policy.
+  directory-sync:
+    build:
+      context: ./services
+      dockerfile: sync.Dockerfile
+    image: agentic-icam/directory-sync:latest
+    command: ["python", "-m", "icam.directory.sync"]
+    restart: unless-stopped
+    depends_on:
+      ldap:
+        condition: service_healthy
+      spire-register:
+        condition: service_completed_successfully
+    environment:
+      LDAP_URL: ldap://ldap:389
+      LDAP_BIND_DN: cn=directory-sync,ou=services,dc=demo,dc=local
+      LDAP_BIND_PASSWORD: ${LDAP_SYNC_PASSWORD:-sync-secret}
+      BASE_POLICY: /config/idp-policy.yaml
+      EFFECTIVE_POLICY: /policy/effective-policy.yaml
+      SYNC_INTERVAL: "10"
+    volumes:
+      - ./config/idp-policy.yaml:/config/idp-policy.yaml:ro
+      - policy:/policy
+      - spire-server-socket:/tmp/spire-server/private
+    healthcheck:
+      test: ["CMD", "test", "-f", "/policy/.synced"]
+      <<: *http-health
+
   # ------------------------------------------------------------------ Identity provider
   pingfederate:
     <<: *python-service
     command: ["python", "-m", "icam.idp.app"]
     labels:
       ai.demo.spiffe-workload: pingfederate
+    depends_on:
+      spire-agent:
+        condition: service_healthy
+      directory-sync:
+        condition: service_healthy
     environment:
-      <<: *python-env
-      PF_POLICY: /config/idp-policy.yaml
+      <<: [*python-env, *ldap-idp-env]
+      PF_POLICY: /policy/effective-policy.yaml
       PF_MTLS_BASE: https://pingfederate:9443
       DEMO_EXPLAIN: "true"
     volumes:
       - spire-agent-socket:/run/spire/sockets:ro
-      - ./config/idp-policy.yaml:/config/idp-policy.yaml:ro
+      - policy:/policy:ro
     ports:
       - "9031:9031"   # browser + back channel
       - "9443:9443"   # mTLS token endpoint alias
@@ -185,10 +242,12 @@ services:
       OIDC_CLIENT_SECRET: portal-secret
       OIDC_REDIRECT_URI: http://localhost:8080/callback
       PUBLIC_URL: http://localhost:8080
+      EFFECTIVE_POLICY: /policy/effective-policy.yaml
     depends_on:
       pingfederate:
         condition: service_healthy
-    volumes: []
+    volumes:
+      - policy:/policy:ro
     ports:
       - "8080:8080"
     healthcheck: *tcp-health
@@ -203,14 +262,19 @@ services:
       <<: *python-env
       HEALTH_PORT: "8090"
       AGENT_NAME: analysis-agent
-      AGENT_POLICY: /config/idp-policy.yaml
+      AGENT_POLICY: /policy/effective-policy.yaml
       SYSTEMS_API_URL: https://systems-api:8443
       OPS_MCP_URL: https://ops-mcp:8443/mcp
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-5-5}
+    depends_on:
+      spire-agent:
+        condition: service_healthy
+      directory-sync:
+        condition: service_healthy
     volumes:
       - spire-agent-socket:/run/spire/sockets:ro
-      - ./config/idp-policy.yaml:/config/idp-policy.yaml:ro
+      - policy:/policy:ro
     healthcheck: *tcp-health
 
   remediation-agent:
@@ -222,14 +286,19 @@ services:
       <<: *python-env
       HEALTH_PORT: "8090"
       AGENT_NAME: remediation-agent
-      AGENT_POLICY: /config/idp-policy.yaml
+      AGENT_POLICY: /policy/effective-policy.yaml
       SYSTEMS_API_URL: https://systems-api:8443
       OPS_MCP_URL: https://ops-mcp:8443/mcp
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-5-5}
+    depends_on:
+      spire-agent:
+        condition: service_healthy
+      directory-sync:
+        condition: service_healthy
     volumes:
       - spire-agent-socket:/run/spire/sockets:ro
-      - ./config/idp-policy.yaml:/config/idp-policy.yaml:ro
+      - policy:/policy:ro
     healthcheck: *tcp-health
 
   # ------------------------------------------------------------------ Enterprise resources
@@ -304,3 +373,5 @@ volumes:
   partner-server-data:
   partner-server-socket:
   partner-agent-socket:
+  ldap-data:
+  policy:

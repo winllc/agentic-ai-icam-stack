@@ -53,8 +53,9 @@ ensure() {
   echo "[register] created: $id"
 }
 
-# --- demo.local: node alias + workloads (docker WorkloadAttestor matches container labels;
-# production would also pin docker:image_config_digest).
+# --- demo.local: node alias + infrastructure workloads (docker WorkloadAttestor matches
+# container labels; production would also pin docker:image_config_digest). Agent entries are
+# NOT registered here: directory-sync owns them, driven by the LDAP directory (ou=agents).
 NODE_ID="spiffe://$TD/node/docker-host"
 ensure "$DEMO_SOCK" "$NODE_ID" -node -selector "x509pop:subject:cn:docker-host"
 while read -r path label dns fed; do
@@ -64,8 +65,6 @@ while read -r path label dns fed; do
   ensure "$DEMO_SOCK" "spiffe://$TD/$path" "${args[@]}"
 done <<'ENTRIES'
 idp/pingfederate              pingfederate        pingfederate        -
-agent/analysis-agent          analysis-agent      analysis-agent      federated
-agent/remediation-agent       remediation-agent   remediation-agent   federated
 resource/systems-api          systems-api         systems-api         -
 resource/ops-mcp              ops-mcp             ops-mcp             -
 ops/pf-configurator           pf-configurator     pf-configurator     -

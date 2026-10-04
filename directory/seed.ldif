@@ -1,0 +1,106 @@
+dn: dc=demo,dc=local
+objectClass: dcObject
+objectClass: organization
+dc: demo
+o: Agentic AI ICAM Demo
+
+dn: ou=people,dc=demo,dc=local
+objectClass: organizationalUnit
+ou: people
+
+dn: ou=agents,dc=demo,dc=local
+objectClass: organizationalUnit
+ou: agents
+description: Agentic AI non-person entities (system of record for SPIRE + OAuth clients)
+
+dn: ou=services,dc=demo,dc=local
+objectClass: organizationalUnit
+ou: services
+
+dn: cn=directory-sync,ou=services,dc=demo,dc=local
+objectClass: applicationProcess
+objectClass: simpleSecurityObject
+cn: directory-sync
+description: Reads agents and renders SPIRE entries + effective IdP policy
+userPassword: @SYNC_PW@
+
+dn: cn=idp,ou=services,dc=demo,dc=local
+objectClass: applicationProcess
+objectClass: simpleSecurityObject
+cn: idp
+description: PingFederate (or the simulator): authentication + attribute lookups
+userPassword: @IDP_PW@
+
+dn: uid=alice,ou=people,dc=demo,dc=local
+objectClass: inetOrgPerson
+objectClass: icamPerson
+uid: alice
+cn: Alice Rivera
+sn: Rivera
+displayName: Alice Rivera
+mail: alice@demo.local
+employeeType: sre-leads
+userPassword: @ALICE_PW@
+icamEntitlement: systems:read
+icamEntitlement: systems:analyze
+icamEntitlement: metrics:read
+icamEntitlement: tickets:read
+icamEntitlement: tickets:write
+icamEntitlement: partner:status.read
+icamEntitlement: partner:cases.write
+
+dn: uid=bob,ou=people,dc=demo,dc=local
+objectClass: inetOrgPerson
+objectClass: icamPerson
+uid: bob
+cn: Bob Chen
+sn: Chen
+displayName: Bob Chen
+mail: bob@demo.local
+employeeType: analysts
+userPassword: @BOB_PW@
+icamEntitlement: systems:read
+icamEntitlement: metrics:read
+icamEntitlement: partner:status.read
+
+dn: cn=analysis-agent,ou=agents,dc=demo,dc=local
+objectClass: applicationProcess
+objectClass: icamAgent
+cn: analysis-agent
+description: Read-only analysis agent
+icamSponsor: uid=alice,ou=people,dc=demo,dc=local
+icamSpiffeId: spiffe://demo.local/agent/analysis-agent
+icamWorkloadSelector: docker:label:ai.demo.spiffe-workload:analysis-agent
+icamScopeCeiling: systems:read
+icamScopeCeiling: systems:analyze
+icamScopeCeiling: metrics:read
+icamScopeCeiling: tickets:read
+icamScopeCeiling: partner:status.read
+icamAllowedResource: https://systems-api:8443
+icamAllowedResource: https://ops-mcp:8443/mcp
+icamAllowedResource: https://partner-as:8443
+icamFederatesWith: partner.example
+icamLifecycleStatus: active
+icamExpires: 20271231235959Z
+icamLastRecertified: 20260915000000Z
+
+dn: cn=remediation-agent,ou=agents,dc=demo,dc=local
+objectClass: applicationProcess
+objectClass: icamAgent
+cn: remediation-agent
+description: Remediation agent (may open tickets, cannot run diagnostics)
+icamSponsor: uid=alice,ou=people,dc=demo,dc=local
+icamSpiffeId: spiffe://demo.local/agent/remediation-agent
+icamWorkloadSelector: docker:label:ai.demo.spiffe-workload:remediation-agent
+icamScopeCeiling: systems:read
+icamScopeCeiling: tickets:read
+icamScopeCeiling: tickets:write
+icamScopeCeiling: partner:status.read
+icamScopeCeiling: partner:cases.write
+icamAllowedResource: https://systems-api:8443
+icamAllowedResource: https://ops-mcp:8443/mcp
+icamAllowedResource: https://partner-as:8443
+icamFederatesWith: partner.example
+icamLifecycleStatus: active
+icamExpires: 20271231235959Z
+icamLastRecertified: 20260915000000Z

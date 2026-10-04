@@ -1,0 +1,54 @@
+# Agentic AI ICAM demo schema. OIDs live under 1.3.6.1.4.1.32473, the IANA enterprise
+# number reserved for documentation (RFC 5612) - replace with your own arc in production.
+
+attributetype ( 1.3.6.1.4.1.32473.1.1.1 NAME 'icamEntitlement'
+  DESC 'OAuth scope a person (or agent) may hold'
+  EQUALITY caseExactMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
+
+attributetype ( 1.3.6.1.4.1.32473.1.1.2 NAME 'icamSpiffeId'
+  DESC 'SPIFFE ID the agent workload is issued'
+  EQUALITY caseExactIA5Match SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 SINGLE-VALUE )
+
+attributetype ( 1.3.6.1.4.1.32473.1.1.3 NAME 'icamWorkloadSelector'
+  DESC 'SPIRE selector type:value that attests the workload'
+  EQUALITY caseExactMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
+
+attributetype ( 1.3.6.1.4.1.32473.1.1.4 NAME 'icamScopeCeiling'
+  DESC 'Most an agent may ever be delegated (its OAuth client restricted scopes)'
+  EQUALITY caseExactMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
+
+attributetype ( 1.3.6.1.4.1.32473.1.1.5 NAME 'icamAllowedResource'
+  DESC 'Resource (RFC 8707) or partner AS the agent may obtain tokens for'
+  EQUALITY caseExactMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
+
+attributetype ( 1.3.6.1.4.1.32473.1.1.6 NAME 'icamFederatesWith'
+  DESC 'Foreign SPIFFE trust domain whose bundle the agent receives'
+  EQUALITY caseExactMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
+
+attributetype ( 1.3.6.1.4.1.32473.1.1.7 NAME 'icamLifecycleStatus'
+  DESC 'active | suspended | disabled'
+  EQUALITY caseIgnoreMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+
+attributetype ( 1.3.6.1.4.1.32473.1.1.8 NAME 'icamExpires'
+  DESC 'Identity is invalid after this time unless recertified'
+  EQUALITY generalizedTimeMatch ORDERING generalizedTimeOrderingMatch
+  SYNTAX 1.3.6.1.4.1.1466.115.121.1.24 SINGLE-VALUE )
+
+attributetype ( 1.3.6.1.4.1.32473.1.1.9 NAME 'icamLastRecertified'
+  DESC 'Last access review of this identity'
+  EQUALITY generalizedTimeMatch ORDERING generalizedTimeOrderingMatch
+  SYNTAX 1.3.6.1.4.1.1466.115.121.1.24 SINGLE-VALUE )
+
+attributetype ( 1.3.6.1.4.1.32473.1.1.10 NAME 'icamSponsor'
+  DESC 'Accountable person for a non-person entity'
+  SUP distinguishedName SINGLE-VALUE )
+
+objectclass ( 1.3.6.1.4.1.32473.1.2.1 NAME 'icamPerson' SUP top AUXILIARY
+  DESC 'Person with delegable entitlements'
+  MAY ( icamEntitlement ) )
+
+objectclass ( 1.3.6.1.4.1.32473.1.2.2 NAME 'icamAgent' SUP top AUXILIARY
+  DESC 'Agentic AI non-person entity'
+  MUST ( icamSpiffeId $ icamLifecycleStatus $ icamSponsor )
+  MAY ( icamWorkloadSelector $ icamScopeCeiling $ icamAllowedResource $ icamFederatesWith $
+        icamExpires $ icamLastRecertified ) )

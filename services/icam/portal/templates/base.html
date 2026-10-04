@@ -33,7 +33,7 @@ table{width:100%;border-collapse:collapse;font-size:13px;margin-top:6px} td,th{t
 .sev{font-weight:700;text-transform:uppercase}.sev.high,.sev.critical{color:var(--bad)}.sev.medium{color:var(--warn)}.sev.ok,.sev.low{color:var(--ok)}
 .summary{white-space:pre-wrap;font-size:14px}
 </style></head><body>
-<header><b>Agentic AI Service</b>
+<header><span><b>Agentic AI Service</b> &nbsp;<a class="small" href="/directory">Directory</a></span>
 <div class="who">{% if user %}Signed in as <b>{{ user.id_claims.name }}</b> ({{ user.id_claims.sub }}) &nbsp;
 <a class="btn ghost" href="/logout">Sign out</a>{% endif %}</div></header>
 <main>{% block body %}{% endblock %}</main></body></html>

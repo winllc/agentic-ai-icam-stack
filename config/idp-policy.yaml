@@ -1,11 +1,11 @@
-# Policy for the PingFederate-compatible demo authorization server.
-# The same objects map 1:1 onto PingFederate configuration (see pingfederate/README.md):
-#   users            -> Password Credential Validator + attribute contract
-#   clients          -> OAuth clients
-#   agent ceilings   -> per-client "Restrict scopes" on the token-exchange client
+# Base policy for the authorization server (simulator or PingFederate). Identity data is NOT
+# here: people (credentials, entitlements) and agents (non-person entities: sponsor,
+# lifecycle, ceiling, selectors) live in the LDAP directory (directory/seed.ldif).
+# directory-sync merges the directory into this file and writes the *effective* policy
+# (/policy/effective-policy.yaml) that the IdPs and agents consume.
 #
-# Delegated scope = (scopes in the user's token)
-#                 ∩ (scopes the agent client is allowed)
+# Delegated scope = (scopes in the user's token, narrowed by the user's LDAP entitlements)
+#                 ∩ (the agent's LDAP scope ceiling)
 #                 ∩ (scopes the agent requested for this task)
 
 scopes:
@@ -21,23 +21,6 @@ scopes:
   partner:status.read: Read a partner's service status (external API)
   partner:cases.write: Open support cases with a partner (external API)
 
-users:
-  alice:
-    password: alice
-    name: Alice Rivera
-    email: alice@demo.local
-    groups: [sre-leads]
-    # Alice is entitled to everything, including opening tickets.
-    entitlements: [systems:read, systems:analyze, metrics:read, tickets:read, tickets:write,
-                   partner:status.read, partner:cases.write]
-  bob:
-    password: bob
-    name: Bob Chen
-    email: bob@demo.local
-    groups: [analysts]
-    # Bob can look (including at partners), but cannot run diagnostics, touch tickets or open cases.
-    entitlements: [systems:read, metrics:read, partner:status.read]
-
 clients:
   agentic-ai-portal:
     description: Agentic AI Service (user-facing web app)
@@ -50,25 +33,14 @@ clients:
     access_token_audience: agentic-ai-service
     access_token_ttl: 900
 
-  analysis-agent:
-    description: Read-only analysis agent
-    token_endpoint_auth_method: tls_client_auth            # RFC 8705 mTLS client auth
-    tls_client_auth_san_uri: spiffe://demo.local/agent/analysis-agent
-    grant_types: [urn:ietf:params:oauth:grant-type:token-exchange]
-    allowed_scopes: [systems:read, systems:analyze, metrics:read, tickets:read, partner:status.read]
-    allowed_resources: [https://systems-api:8443, https://ops-mcp:8443/mcp, https://partner-as:8443]
-    subject_token_audiences: [agentic-ai-service]          # whose user tokens it may exchange
-    access_token_ttl: 300
-
-  remediation-agent:
-    description: Remediation agent (may open tickets, cannot run diagnostics)
-    token_endpoint_auth_method: tls_client_auth
-    tls_client_auth_san_uri: spiffe://demo.local/agent/remediation-agent
-    grant_types: [urn:ietf:params:oauth:grant-type:token-exchange]
-    allowed_scopes: [systems:read, tickets:read, tickets:write, partner:status.read, partner:cases.write]
-    allowed_resources: [https://systems-api:8443, https://ops-mcp:8443/mcp, https://partner-as:8443]
-    subject_token_audiences: [agentic-ai-service]
-    access_token_ttl: 300
+# Settings every agent client gets; directory-sync adds one client per icamAgent entry
+# (client_id = cn, tls_client_auth_san_uri = icamSpiffeId, allowed_scopes = icamScopeCeiling,
+# allowed_resources = icamAllowedResource, enabled = active and not expired).
+agent_client_template:
+  token_endpoint_auth_method: tls_client_auth              # RFC 8705 mTLS client auth (SVID)
+  grant_types: [urn:ietf:params:oauth:grant-type:token-exchange]
+  subject_token_audiences: [agentic-ai-service]            # whose user tokens agents may exchange
+  access_token_ttl: 300
 
 # Cross-domain identity chaining (draft-ietf-oauth-identity-chaining): an agent exchanges the
 # user's token for a short-lived JWT authorization grant addressed to a partner's AS, then

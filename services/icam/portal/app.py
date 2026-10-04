@@ -177,6 +177,20 @@ def task():
     return render_template("result.html", user=user, r=result)
 
 
+@app.get("/directory")
+def directory_view():
+    """Agent non-person entities as directory-sync rendered them from LDAP (what is enforced)."""
+    import yaml
+    path = os.environ.get("EFFECTIVE_POLICY", "/policy/effective-policy.yaml")
+    try:
+        clients = yaml.safe_load(open(path))["clients"]
+        synced_at = time.strftime("%H:%M:%S", time.localtime(os.stat(path).st_mtime))
+    except OSError:
+        clients, synced_at = {}, None
+    agents = {k: c for k, c in clients.items() if "directory" in c}
+    return render_template("directory.html", user=current(), agents=agents, synced_at=synced_at)
+
+
 @app.get("/healthz")
 def healthz():
     return "ok"

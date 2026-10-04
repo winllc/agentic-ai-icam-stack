@@ -35,6 +35,7 @@ from flask import Flask, jsonify, make_response, redirect, render_template_strin
 from werkzeug.serving import make_server
 
 from icam.common import logs
+from icam.directory.ldapdir import Directory
 from icam.common.spiffe_identity import WorkloadIdentity, peer_cert_from_environ, spiffe_ids, x5t_s256
 from icam.common.federation import TT_JWT, pairwise_subject
 from icam.common.tokens import scopes_of
@@ -43,7 +44,19 @@ log = logs.setup("pingfederate-sim")
 
 ISSUER = os.environ.get("PF_ISSUER", "http://localhost:9031").rstrip("/")
 MTLS_BASE = os.environ.get("PF_MTLS_BASE", "https://pingfederate:9443").rstrip("/")
-POLICY = yaml.safe_load(open(os.environ.get("PF_POLICY", "/config/idp-policy.yaml")))
+POLICY_PATH = os.environ.get("PF_POLICY", "/policy/effective-policy.yaml")
+_policy: dict = {"mtime": None, "data": None}
+
+
+def policy() -> dict:
+    """Effective policy rendered by directory-sync from LDAP; reloaded whenever it changes."""
+    mtime = os.stat(POLICY_PATH).st_mtime
+    if mtime != _policy["mtime"]:
+        _policy.update(mtime=mtime, data=yaml.safe_load(open(POLICY_PATH)))
+    return _policy["data"]
+
+
+directory = Directory()   # people: authentication + attributes come from LDAP
 EXPLAIN = os.environ.get("DEMO_EXPLAIN", "true").lower() == "true"
 
 TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
@@ -89,7 +102,7 @@ def client_from_basic_or_post():
 
 
 def ordered(scopes) -> str:
-    known = list(POLICY["scopes"])
+    known = list(policy()["scopes"])
     return " ".join(sorted(scopes, key=lambda s: known.index(s) if s in known else 99))
 
 
@@ -110,7 +123,7 @@ def discovery():
         userinfo_endpoint=f"{ISSUER}/idp/userinfo.openid",
         jwks_uri=f"{ISSUER}/pf/JWKS",
         end_session_endpoint=f"{ISSUER}/idp/startSLO.ping",
-        scopes_supported=list(POLICY["scopes"]),
+        scopes_supported=list(policy()["scopes"]),
         response_types_supported=["code"],
         grant_types_supported=["authorization_code", TOKEN_EXCHANGE],
         code_challenge_methods_supported=["S256"],
@@ -146,7 +159,7 @@ LOGIN_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>Sign On<
 <label>Password</label><input name="pf.pass" type="password">
 {% if error %}<div class="err">{{ error }}</div>{% endif %}
 <button type="submit">Sign On</button>
-<div class="hint">Demo users: <code>alice / alice</code> (SRE lead, broad entitlements) &middot;
+<div class="hint">Directory (LDAP) users: <code>alice / alice</code> (SRE lead, broad entitlements) &middot;
 <code>bob / bob</code> (analyst, read-only)<br>PKCE: <code>{{ params.code_challenge_method }}</code> challenge
 <code>{{ params.code_challenge[:16] }}…</code></div>
 </form></body></html>"""
@@ -163,7 +176,7 @@ def authz_error_page(msg: str):
 def authorize():
     src = request.values
     params = {k: src.get(k, "") for k in AUTHZ_PARAMS}
-    client = POLICY["clients"].get(params["client_id"])
+    client = policy()["clients"].get(params["client_id"])
     if not client or "authorization_code" not in client.get("grant_types", []):
         return authz_error_page("unknown client_id")
     if params["redirect_uri"] not in client["redirect_uris"]:
@@ -177,10 +190,10 @@ def authorize():
     error = None
     if request.method == "POST":
         name, pw = src.get("pf.username", ""), src.get("pf.pass", "")
-        u = POLICY["users"].get(name)
-        if u and secrets.compare_digest(u["password"], pw):
+        person = directory.authenticate(name, pw)     # LDAP simple bind as the user
+        if person:
             user = name
-            record("authn_success", user=name, client_id=params["client_id"], method="HTML form")
+            record("authn_success", user=name, client_id=params["client_id"], method="LDAP bind")
         else:
             error = "Invalid username or password."
             record("authn_failure", user=name)
@@ -203,7 +216,7 @@ def authorize():
 def logout():
     sessions.pop(request.cookies.get("PF", ""), None)
     target = request.args.get("TargetResource") or request.args.get("post_logout_redirect_uri") or "/"
-    allowed = [u.rsplit("/", 1)[0] for c in POLICY["clients"].values() for u in c.get("redirect_uris", [])]
+    allowed = [u.rsplit("/", 1)[0] for c in policy()["clients"].values() for u in c.get("redirect_uris", [])]
     if not any(target == a or target.startswith(a + "/") for a in allowed):
         target = "/"
     resp = redirect(target)
@@ -225,7 +238,7 @@ def token():
 
 def grant_authorization_code():
     client_id, secret = client_from_basic_or_post()
-    client = POLICY["clients"].get(client_id or "")
+    client = policy()["clients"].get(client_id or "")
     if not client or not secret or not secrets.compare_digest(client.get("client_secret", ""), secret):
         return oauth_error("invalid_client", "client authentication failed", 401)
     data = codes.pop(request.form.get("code", ""), None)
@@ -238,7 +251,9 @@ def grant_authorization_code():
     if not verifier or not secrets.compare_digest(challenge, data["code_challenge"]):
         return oauth_error("invalid_grant", "PKCE verification failed")
 
-    user = POLICY["users"][data["user"]]
+    user = directory.person(data["user"])            # entitlements as of now, from LDAP
+    if not user:
+        return oauth_error("invalid_grant", "user no longer exists in the directory")
     requested = set(data["scope"].split())
     oidc = requested & {"openid", "profile", "email"}
     granted = (requested & set(client["allowed_scopes"]) & set(user["entitlements"])) | oidc
@@ -248,6 +263,7 @@ def grant_authorization_code():
         "iss": ISSUER, "sub": data["user"], "aud": client["access_token_audience"],
         "client_id": client_id, "scope": ordered(granted), "iat": now, "exp": now + ttl,
         "jti": uuid.uuid4().hex, "name": user["name"], "groups": user["groups"],
+        "entitlements": " ".join(user["entitlements"]),
     })
     id_token = sign({
         "iss": ISSUER, "sub": data["user"], "aud": client_id, "iat": now, "exp": now + ttl,
@@ -268,7 +284,7 @@ def grant_token_exchange():
                            "token exchange requires mTLS - use the mtls_endpoint_aliases token endpoint", 401)
     presented_ids = spiffe_ids(cert)
     client_id = request.form.get("client_id")
-    client = POLICY["clients"].get(client_id or "")
+    client = policy()["clients"].get(client_id or "")
     if not client or client.get("token_endpoint_auth_method") != "tls_client_auth":
         return oauth_error("invalid_client", f"unknown mTLS client {client_id!r}", 401)
     if client["tls_client_auth_san_uri"] not in presented_ids:
@@ -277,6 +293,9 @@ def grant_token_exchange():
                            f"{client['tls_client_auth_san_uri']}", 401)
     if TOKEN_EXCHANGE not in client["grant_types"]:
         return oauth_error("unauthorized_client", "client may not use token exchange")
+    if not client.get("enabled", True):
+        reason = client.get("directory", {}).get("reason", "disabled")
+        return oauth_error("invalid_client", f"agent client disabled in the directory ({reason})", 401)
 
     # --- 2. Subject token: the end user's access token, issued by us to an allowed audience.
     if request.form.get("subject_token_type") != TT_ACCESS:
@@ -300,7 +319,7 @@ def grant_token_exchange():
 
     # --- 3b. Identity chaining: a grant for a partner's AS is minted separately from
     # internal tokens and may only carry that partner's egress scopes.
-    partners = {f["authorization_server"]: (td, f) for td, f in POLICY.get("federation", {}).items()}
+    partners = {f["authorization_server"]: (td, f) for td, f in policy().get("federation", {}).items()}
     partner = partners.get(resources[0])
     if partner and len(resources) > 1:
         return oauth_error("invalid_target", "a federation grant is addressed to exactly one partner AS")
@@ -385,8 +404,8 @@ def userinfo():
         claims = verify_own(auth.split(" ", 1)[1])
     except Exception:
         return oauth_error("invalid_token", "bad access token", 401)
-    u = POLICY["users"][claims["sub"]]
-    return jsonify(sub=claims["sub"], name=u["name"], email=u["email"], groups=u["groups"])
+    u = directory.person(claims["sub"]) or {}
+    return jsonify(sub=claims["sub"], name=u.get("name"), email=u.get("email"), groups=u.get("groups"))
 
 
 @app.get("/demo/audit")

@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block body %}
+<p><a href="/">← back</a></p>
+<div class="card"><h2>Agent identities (LDAP <code>ou=agents</code>)</h2>
+<p class="small mute">The directory is the system of record. <code>directory-sync</code> turns each entry into a SPIRE
+registration entry and an OAuth client. A disabled or expired agent loses both within one sync interval.
+{% if synced_at %}Last change rendered at {{ synced_at }}.{% endif %}</p>
+<div style="overflow-x:auto"><table class="dir">
+<tr><th>Agent</th><th>Lifecycle</th><th>Sponsor</th><th>Expires</th><th>Recertified</th><th>Scope ceiling</th><th>Allowed resources</th></tr>
+{% for name, c in agents.items() %}{% set d = c.directory %}
+<tr>
+ <td><b>{{ name }}</b><div class="small mute">{{ c.description }}</div><code class="small">{{ d.spiffe_id }}</code>
+   {% for sel in d.selectors %}<div class="small mute">{{ sel }}</div>{% endfor %}</td>
+ <td>{% if d.effective %}<span class="allowed">active</span>{% else %}<span class="deny">{{ d.reason }}</span>{% endif %}
+   <div class="small mute">{{ d.dn }}</div></td>
+ <td>{{ d.sponsor_name or d.sponsor }}</td>
+ <td class="small">{{ (d.expires or '—')[:10] }}</td>
+ <td class="small">{{ (d.last_recertified or '—')[:10] }}</td>
+ <td>{% for sc in c.allowed_scopes %}<span class="chip">{{ sc }}</span>{% endfor %}</td>
+ <td class="small">{% for r in c.allowed_resources %}<div><code>{{ r }}</code></div>{% endfor %}
+   {% if d.federates_with %}<div class="mute">federates with {{ d.federates_with|join(', ') }}</div>{% endif %}</td>
+</tr>{% else %}<tr><td colspan="7" class="mute">No agents synced yet.</td></tr>{% endfor %}
+</table></div></div>
+<style>.dir code{word-break:break-all}.dir td{min-width:90px}</style>
+{% endblock %}

@@ -55,18 +55,24 @@ services:
         condition: service_healthy
       pingfederate:
         condition: service_healthy
+      directory-sync:
+        condition: service_healthy
     environment:
       SPIFFE_ENDPOINT_SOCKET: unix:///run/spire/sockets/agent.sock
+      # PingFederate authenticates users and reads entitlements from the directory.
+      LDAP_HOST: ldap:389
+      LDAP_BIND_DN: cn=idp,ou=services,dc=demo,dc=local
+      LDAP_BIND_PASSWORD: ${LDAP_IDP_PASSWORD:-idp-secret}
       PF_ADMIN_URL: https://pingfederate:9999
       PF_ADMIN_USER: ${PF_ADMIN_USER:-administrator}
       PF_ADMIN_PASSWORD: ${PF_ADMIN_PASSWORD:-2FederateM0re}
       PF_ISSUER: https://localhost:9031
-      PF_POLICY: /config/idp-policy.yaml
+      PF_POLICY: /policy/effective-policy.yaml
       PF_TRUST_DIR: /pf-trust
-      SYNC_INTERVAL: "30"
+      SYNC_INTERVAL: "10"
     volumes:
       - spire-agent-socket:/run/spire/sockets:ro
-      - ./config/idp-policy.yaml:/config/idp-policy.yaml:ro
+      - policy:/policy:ro
       - pf-trust:/pf-trust
       - spire-pki:/pki:ro
     healthcheck:
@@ -81,6 +87,7 @@ services:
       <<: *real-pf-env
     volumes: !override
       - pf-trust:/pf-trust:ro
+      - policy:/policy:ro
     depends_on: !override
       <<: *after-configurator
 
@@ -91,7 +98,7 @@ services:
     volumes: !override
       - spire-agent-socket:/run/spire/sockets:ro
       - pf-trust:/pf-trust:ro
-      - ./config/idp-policy.yaml:/config/idp-policy.yaml:ro
+      - policy:/policy:ro
     depends_on: !override
       <<: *after-configurator
 

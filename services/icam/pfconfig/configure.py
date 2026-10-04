@@ -3,7 +3,7 @@ same config/idp-policy.yaml the simulator uses, then keeps SPIRE trust in sync.
 
 Objects created (all idempotent - PUT when present, POST otherwise):
   scopes ............... authServerSettings common scopes
-  demo-pcv ............. Simple Username/Password Credential Validator (policy users)
+  directory ............ LDAP data store + LDAP password validator (people in ou=people)
   htmlform ............. HTML Form IdP Adapter  -> IdP adapter grant mapping
   user-atm ............. JWT ATM for user tokens (aud=agentic-ai-service, entitlements claim)
   portal-oidc .......... OIDC policy (ID token) on user-atm
@@ -12,7 +12,7 @@ Objects created (all idempotent - PUT when present, POST otherwise):
   agent-delegation ..... token-exchange processor policy (subject token -> attributes)
   delegated-atm ........ JWT ATM for delegated tokens (aud=resources, act claim)
   <agent clients> ...... client: token exchange, CERTIFICATE auth (SPIFFE SVID), restricted scopes
-  SSL runtime cert ..... demo TLS CA-issued (pki-init), SAN pingfederate + localhost
+  SSL runtime cert ..... enterprise TLS issuing CA (pki-init), SAN pingfederate + localhost
   Trusted CAs .......... SPIRE X.509 authorities (synced continuously)
 
 Enforcement of  User ∩ Agent ∩ Requested  in PingFederate:
@@ -48,7 +48,19 @@ ADMIN = os.environ.get("PF_ADMIN_URL", "https://pingfederate:9999").rstrip("/")
 ADMIN_USER = os.environ.get("PF_ADMIN_USER", "administrator")
 ADMIN_PASSWORD = os.environ.get("PF_ADMIN_PASSWORD", "2FederateM0re")
 ISSUER = os.environ.get("PF_ISSUER", "https://localhost:9031").rstrip("/")
-POLICY = yaml.safe_load(open(os.environ.get("PF_POLICY", "/config/idp-policy.yaml")))
+POLICY_PATH = os.environ.get("PF_POLICY", "/policy/effective-policy.yaml")
+
+
+def load_policy() -> str:
+    """(Re)load the effective policy rendered by directory-sync; returns its content hash."""
+    global POLICY
+    raw = open(POLICY_PATH, "rb").read()
+    POLICY = yaml.safe_load(raw)
+    return hashlib.sha256(raw).hexdigest()
+
+
+POLICY: dict = {}
+POLICY_HASH = load_policy()
 TRUST_DIR = os.environ.get("PF_TRUST_DIR", "/pf-trust")
 TRUST_DOMAIN = os.environ.get("SPIFFE_TRUST_DOMAIN", "demo.local")
 SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "60"))
@@ -190,7 +202,7 @@ def bootstrap(api: Api):
 # ------------------------------------------------------------------ configuration
 
 def configure_runtime_tls(api: Api):
-    """Runtime HTTPS key pair issued by the demo TLS CA (pki-init): valid for the browser
+    """Runtime HTTPS key pair issued by the enterprise TLS issuing CA (pki-init): valid for the browser
     (localhost) and containers (pingfederate), and stable across PingFederate re-creation."""
     key_id = "runtime-tls"
     if not any(k["id"] == key_id for k in api.get("/keyPairs/sslServer")["items"]):
@@ -198,7 +210,7 @@ def configure_runtime_tls(api: Api):
             api.call("POST", "/keyPairs/sslServer/import", {
                 "id": key_id, "fileData": base64.b64encode(f.read()).decode(),
                 "format": "PKCS12", "password": TLS_P12_PASSWORD})
-        log.info("imported runtime TLS key pair %s from the demo TLS CA", key_id)
+        log.info("imported runtime TLS key pair %s from the enterprise TLS issuing CA", key_id)
     settings = api.get("/keyPairs/sslServer/settings")
     if settings["runtimeServerCertRef"]["id"] != key_id:
         settings["runtimeServerCertRef"] = ref(key_id)
@@ -206,7 +218,8 @@ def configure_runtime_tls(api: Api):
         api.call("PUT", "/keyPairs/sslServer/settings", settings)
         log.info("activated runtime TLS certificate %s", key_id)
     os.makedirs(TRUST_DIR, exist_ok=True)
-    with open(os.path.join(PKI_DIR, "demo-tls-ca.crt")) as src, open(os.path.join(TRUST_DIR, "pf-ca.pem"), "w") as dst:
+    # Clients trust the enterprise root (the TLS issuing CA chains to it).
+    with open(os.path.join(PKI_DIR, "trust-anchor.pem")) as src, open(os.path.join(TRUST_DIR, "pf-ca.pem"), "w") as dst:
         dst.write(src.read())
 
 
@@ -224,22 +237,33 @@ def configure_scopes(api: Api):
     log.info("scopes: %s", sorted(s["name"] for s in settings["scopes"]))
 
 
+PEOPLE_BASE = os.environ.get("LDAP_PEOPLE_BASE", "ou=people,dc=demo,dc=local")
+
+
 def configure_authentication(api: Api):
-    users = POLICY["users"]
+    """People authenticate against the LDAP directory (simple bind via an LDAP PCV)."""
+    store = {
+        "type": "LDAP", "id": "directory", "name": "Enterprise directory (OpenLDAP)", "ldapType": "GENERIC",
+        "hostnames": [os.environ.get("LDAP_HOST", "ldap:389")], "useSsl": False, "bindAnonymously": False,
+        "userDN": os.environ["LDAP_BIND_DN"], "password": os.environ["LDAP_BIND_PASSWORD"],
+        "maskAttributeValues": False, "testOnBorrow": True,
+    }
+    api.upsert("/dataStores", store)
     api.upsert("/passwordCredentialValidators", {
-        "id": "demopcv", "name": "Demo users",
-        "pluginDescriptorRef": ref("org.sourceid.saml20.domain.SimpleUsernamePasswordCredentialValidator"),
-        "configuration": {"tables": [{"name": "Users", "rows": [{"fields": fields(**{
-            "Username": u, "Password": d["password"], "Confirm Password": d["password"],
-            "Relax Password Requirements": "true"})} for u, d in users.items()]}], "fields": []},
-        "attributeContract": {"coreAttributes": [{"name": "username"}]},
+        "id": "directorypcv", "name": "Enterprise directory users",
+        "pluginDescriptorRef": ref("org.sourceid.saml20.domain.LDAPUsernamePasswordCredentialValidator"),
+        "configuration": {"tables": [{"name": "Authentication Error Overrides", "rows": []}],
+                          "fields": fields(**{"LDAP Datastore": "directory", "Search Base": PEOPLE_BASE,
+                                              "Search Filter": "uid=${username}", "Scope of Search": "Subtree",
+                                              "Case-Sensitive Matching": "false"})},
+        "attributeContract": {"coreAttributes": [{"name": n} for n in ("DN", "givenName", "mail", "username")]},
     })
     api.upsert("/idp/adapters", {
         "id": "htmlform", "name": "HTML Form",
         "pluginDescriptorRef": ref("com.pingidentity.adapters.htmlform.idp.HtmlFormIdpAuthnAdapter"),
         "configuration": {
             "tables": [{"name": "Credential Validators",
-                        "rows": [{"fields": fields(**{"Password Credential Validator Instance": "demopcv"})}]}],
+                        "rows": [{"fields": fields(**{"Password Credential Validator Instance": "directorypcv"})}]}],
             "fields": fields(**{"Challenge Retries": 3, "Session State": "None", "Session Timeout": 60,
                                 "Session Max Timeout": 480, "Login Template": "html.form.login.template.html",
                                 "Logout Template": "idp.logout.success.page.template.html"}),
@@ -255,6 +279,8 @@ def configure_authentication(api: Api):
         "attributeContractFulfillment": {"USER_KEY": val("ADAPTER", "username"),
                                          "USER_NAME": val("ADAPTER", "username")},
     })
+    if api.exists("/passwordCredentialValidators/demopcv"):     # pre-directory versions of this demo
+        api.call("DELETE", "/passwordCredentialValidators/demopcv")
 
 
 def jwt_atm(id_: str, name: str, audience: str, lifetime_min: int, attrs: list[str], resources=None) -> dict:
@@ -278,24 +304,30 @@ def jwt_atm(id_: str, name: str, audience: str, lifetime_min: int, attrs: list[s
 
 
 def configure_user_tokens(api: Api):
-    users = POLICY["users"]
     portal_id, portal = next((k, c) for k, c in POLICY["clients"].items() if c.get("redirect_uris"))
     api.upsert("/oauth/accessTokenManagers", jwt_atm(
         "useratm", "User access tokens", portal["access_token_audience"], portal.get("access_token_ttl", 900) // 60,
-        ["sub", "name", "groups", "entitlements"]))
+        ["sub", "name", "email", "groups", "entitlements"]))
 
-    def per_user(field, key="USER_KEY"):
-        table = {u: (" ".join(d[field]) if isinstance(d[field], list) else d[field]) for u, d in users.items()}
-        return f'{ognl_map(table)}.get(#this.get("{key}").getValue())'
+    # Attributes are looked up in the directory at token issuance (not cached in config).
+    def from_ldap(attr):
+        return f'@java.lang.String@join(" ", #this.get("ds.people.{attr}").getValues())'
 
     api.upsert_mapping({
         "context": {"type": "DEFAULT"}, "accessTokenManagerRef": ref("useratm"),
+        "attributeSources": [{
+            "type": "LDAP", "id": "people", "description": "Person entry in the directory",
+            "dataStoreRef": ref("directory"), "baseDn": PEOPLE_BASE, "searchScope": "SUBTREE",
+            "searchFilter": "uid=${USER_KEY}",
+            "searchAttributes": ["displayName", "mail", "employeeType", "icamEntitlement"],
+        }],
         "attributeContractFulfillment": {
             "sub": val("OAUTH_PERSISTENT_GRANT", "USER_KEY"),
-            "name": val("EXPRESSION", per_user("name")),
-            "groups": val("EXPRESSION", per_user("groups")),
-            # The user's entitlements = the scopes this user may ever delegate.
-            "entitlements": val("EXPRESSION", per_user("entitlements")),
+            "name": val("LDAP_DATA_STORE", "displayName", "people"),
+            "email": val("LDAP_DATA_STORE", "mail", "people"),
+            "groups": val("EXPRESSION", from_ldap("employeeType")),
+            # The user's entitlements = the scopes this user may ever delegate (LDAP icamEntitlement).
+            "entitlements": val("EXPRESSION", from_ldap("icamEntitlement")),
         },
     })
     api.upsert("/oauth/openIdConnect/policies", {
@@ -305,7 +337,7 @@ def configure_user_tokens(api: Api):
                               "extendedAttributes": [{"name": n} for n in ("name", "email", "groups")]},
         "attributeMapping": {"attributeContractFulfillment": {
             "sub": val("TOKEN", "sub"), "name": val("TOKEN", "name"), "groups": val("TOKEN", "groups"),
-            "email": val("EXPRESSION", per_user("email", key="sub"))}},
+            "email": val("TOKEN", "email")}},
         "includeSriInIdToken": False, "includeUserInfoInIdToken": True,
     })
     api.call("PUT", "/oauth/openIdConnect/settings", {"defaultPolicyRef": ref("portaloidc")})
@@ -472,7 +504,8 @@ def configure_delegation(api: Api, issuer_dn: str):
 
     for client_id, c in agents.items():
         api.upsert("/oauth/clients", {
-            "clientId": client_id, "name": c.get("description", client_id), "enabled": True,
+            # Lifecycle comes from the directory: disabled/expired agents' clients are disabled.
+            "clientId": client_id, "name": c.get("description", client_id), "enabled": c.get("enabled", True),
             "grantTypes": ["TOKEN_EXCHANGE"],
             "clientAuth": {"type": "CERTIFICATE", "clientCertIssuerDn": issuer_dn,
                            "clientCertSubjectDn": f"CN={client_id}, O=SPIRE, C=US"},
@@ -497,17 +530,21 @@ def dn(name: x509.Name) -> str:
 
 
 def sync_spire_trust(api: Api, identity: WorkloadIdentity) -> str:
-    """Import every SPIRE X.509 authority as a PingFederate Trusted CA; return the
+    """Import the SPIRE trust anchors and intermediates as PingFederate Trusted CAs; return the
     DN of the authority currently signing SVIDs (what agent certificates carry as issuer)."""
     identity.fetch()
     authorities = x509.load_pem_x509_certificates(open(identity.bundle_path, "rb").read())
+    # With SPIRE chained under the enterprise PKI the bundle holds only the root; PingFederate
+    # matches the client's *issuer* DN against a Trusted CA, so also import the intermediates
+    # carried in the SVID chain (the current SPIRE CA and the enterprise SPIRE issuing CA).
+    authorities += x509.load_pem_x509_certificates(open(identity.cert_path, "rb").read())[1:]
     trusted = {c["sha256Fingerprint"].lower() for c in api.get("/certificates/ca")["items"]}
     for cert in authorities:
         fp = hashlib.sha256(cert.public_bytes(Encoding.DER)).hexdigest()
         if fp not in trusted:
             api.call("POST", "/certificates/ca/import", {
                 "fileData": base64.b64encode(cert.public_bytes(Encoding.PEM)).decode()})
-            log.info("imported SPIRE CA %s", cert.subject.rfc4514_string())
+            log.info("imported trusted CA %s", cert.subject.rfc4514_string())
     leaf = x509.load_pem_x509_certificates(open(identity.cert_path, "rb").read())[0]
     return dn(leaf.issuer)
 
@@ -524,6 +561,7 @@ def configure_all(api: Api, identity: WorkloadIdentity) -> str:
 
 
 def main():
+    global POLICY_HASH
     api = Api(admin_session())
     identity = WorkloadIdentity(workdir="/run/svid")
     identity.wait_for_svid()
@@ -535,6 +573,13 @@ def main():
     while True:
         time.sleep(SYNC_INTERVAL)
         try:
+            if (new_hash := hashlib.sha256(open(POLICY_PATH, "rb").read()).hexdigest()) != POLICY_HASH:
+                # The directory changed (agent lifecycle, ceiling, resources): re-apply the agent clients.
+                POLICY_HASH = load_policy()
+                configure_delegation(api, issuer_dn)
+                log.info("directory change applied: %s", ", ".join(
+                    f"{k}={'enabled' if c.get('enabled', True) else 'disabled'}"
+                    for k, c in POLICY["clients"].items() if "directory" in c))
             if not api.exists("/oauth/clients/agentic-ai-portal"):
                 # A recreated PingFederate container starts empty: apply everything again.
                 log.warning("configuration missing (PingFederate recreated?) - re-applying")

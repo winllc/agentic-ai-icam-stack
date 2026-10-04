@@ -32,30 +32,53 @@ node_pki() {
 node_pki node docker-host            # trust domain demo.local
 node_pki partner-node partner-host   # trust domain partner.example (the external partner)
 
-# Demo TLS CA + server certificate for a real PingFederate (docker-compose.pingfederate.yml).
-# Stable across PingFederate re-creation, and importable into a browser to avoid warnings.
-mkdir -p tls
-if [[ ! -f tls/demo-tls-ca.crt ]]; then
-  echo "[pki-init] creating demo TLS CA and PingFederate server certificate"
-  openssl req -x509 -newkey rsa:2048 -nodes -keyout tls/demo-tls-ca.key -out tls/demo-tls-ca.crt -days 3650 \
-    -subj "/O=Agentic AI ICAM Demo/CN=Demo TLS CA" \
+# --- Demo enterprise PKI (stands in for an organisation's approved CA hierarchy) ---------
+#   Demo Enterprise Root CA
+#     ├─ Demo Enterprise SPIRE Issuing CA  -> SPIRE UpstreamAuthority: SPIRE's CA is chained
+#     │                                       below it, so SVIDs validate against the root
+#     └─ Demo Enterprise TLS Issuing CA    -> PingFederate's runtime HTTPS certificate
+# One trust anchor (the root) for browsers, legacy systems, PingFederate and partners.
+mkdir -p enterprise
+E=enterprise
+ca_ext='basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid'
+if [[ ! -f $E/root-ca.crt ]]; then
+  echo "[pki-init] creating demo enterprise root CA"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-384 -nodes -keyout $E/root-ca.key -out $E/root-ca.crt \
+    -days 7300 -subj "/C=US/O=Agentic AI ICAM Demo/OU=Enterprise PKI/CN=Demo Enterprise Root CA" \
     -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign"
+fi
+issuing_ca() {   # issuing_ca <name> <CN>
+  local n=$1 cn=$2
+  [[ -f $E/$n.crt ]] && return
+  echo "[pki-init] issuing $cn"
+  openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-384 -nodes -keyout $E/$n.key -out $E/$n.csr \
+    -subj "/C=US/O=Agentic AI ICAM Demo/OU=Enterprise PKI/CN=$cn"
+  printf "$ca_ext\n" > $E/$n.ext
+  openssl x509 -req -in $E/$n.csr -CA $E/root-ca.crt -CAkey $E/root-ca.key -CAcreateserial \
+    -out $E/$n.crt -days 1825 -extfile $E/$n.ext
+  rm -f $E/$n.csr $E/$n.ext
+}
+issuing_ca spire-issuing-ca "Demo Enterprise SPIRE Issuing CA"
+issuing_ca tls-issuing-ca "Demo Enterprise TLS Issuing CA"
+
+mkdir -p tls
+if [[ ! -f tls/pingfederate.p12 ]]; then
+  echo "[pki-init] issuing PingFederate server certificate (TLS issuing CA)"
   openssl req -newkey rsa:2048 -nodes -keyout tls/pingfederate.key -out tls/pingfederate.csr \
-    -subj "/O=Agentic AI ICAM Demo/CN=pingfederate"
-  cat > tls/pingfederate.ext <<EXT
-basicConstraints=critical,CA:FALSE
-keyUsage=critical,digitalSignature,keyEncipherment
-extendedKeyUsage=serverAuth
-subjectAltName=DNS:pingfederate,DNS:localhost
-EXT
-  openssl x509 -req -in tls/pingfederate.csr -CA tls/demo-tls-ca.crt -CAkey tls/demo-tls-ca.key -CAcreateserial \
-    -out tls/pingfederate.crt -days 825 -extfile tls/pingfederate.ext
-  openssl pkcs12 -export -in tls/pingfederate.crt -inkey tls/pingfederate.key -certfile tls/demo-tls-ca.crt \
+    -subj "/C=US/O=Agentic AI ICAM Demo/CN=pingfederate"
+  printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:pingfederate,DNS:localhost\n' > tls/pingfederate.ext
+  openssl x509 -req -in tls/pingfederate.csr -CA $E/tls-issuing-ca.crt -CAkey $E/tls-issuing-ca.key \
+    -CAcreateserial -out tls/pingfederate.crt -days 825 -extfile tls/pingfederate.ext
+  cat $E/tls-issuing-ca.crt > tls/pingfederate-chain.crt
+  openssl pkcs12 -export -in tls/pingfederate.crt -inkey tls/pingfederate.key -certfile tls/pingfederate-chain.crt \
     -name runtime-tls -out tls/pingfederate.p12 -passout pass:"${PF_TLS_P12_PASSWORD:-changeit}"
   rm -f tls/pingfederate.csr tls/pingfederate.ext
 fi
-chmod 0644 tls/demo-tls-ca.crt tls/pingfederate.crt tls/pingfederate.p12
-chmod 0600 tls/demo-tls-ca.key tls/pingfederate.key
+cp $E/root-ca.crt tls/trust-anchor.pem                 # what clients of PingFederate trust
+chmod 0644 $E/*.crt tls/*.crt tls/*.pem tls/pingfederate.p12
+chmod 0600 $E/*.key tls/pingfederate.key
+# SPIRE Server (uid 1000) signs its CA with the SPIRE issuing CA key.
+chown 1000:1000 $E/spire-issuing-ca.key && chmod 0400 $E/spire-issuing-ca.key
 
 # spire-server runs as uid 1000 in the upstream image.
 chown -R 1000:1000 /spire-server-data /spire-server-socket \

@@ -8,6 +8,11 @@ to the agent's X.509-SVID, and uses that token to call enterprise REST and MCP
 resources over mTLS. It can also call an **external partner's API in another trust domain**
 (`partner.example`) through cross-domain identity chaining over SPIFFE federation.
 
+It follows a **hybrid identity model**. An LDAP directory is the system of record: people carry
+their entitlements there, and agents are governed non-person entities with a sponsor, lifecycle,
+expiry, recertification date and scope ceiling. SPIRE issues the short-lived runtime credentials,
+and its CA is chained to an enterprise PKI root, so SVIDs validate in ordinary trust stores.
+
 ```
 User ─1─► Agentic AI Service ─2 OIDC+PKCE─► PingFederate ─3 tokens─► Agentic AI Service
                                                                             │ 4 "Analyze system X"
@@ -48,9 +53,12 @@ To check everything from the command line (needs `pip install requests`). Both s
 ```bash
 python3 scripts/smoke_test.py        # browser flow, 2 users × 2 agents, steps 1-14, scope intersections + cnf/act
 python3 scripts/security_checks.py   # 14 attacks/policy violations that must fail + 2 positive controls
+python3 scripts/governance_checks.py # directory-driven lifecycle: disable, expire, narrow, revoke (~3 min)
 ```
 
 Stop with `docker compose down` (add the same `-f` files in mode B). Add `-v` to wipe all state.
+**Upgrading from a version without the directory or enterprise PKI requires `down -v` once**,
+because SPIRE's CA moves under the enterprise root.
 
 **Requirements:** Docker with Compose v2.24+, on Linux or Docker Desktop. The SPIRE
 Agent uses the docker workload attestor, so it runs with `pid: host`, `cgroup: host`
@@ -73,7 +81,9 @@ model only sees data the delegated token allowed the agent to read.
 | `spire-agent` | SPIRE Agent: Workload API socket, docker workload attestor | internal |
 | `systems-api` | Enterprise REST API (inventory, metrics, diagnostics) | internal `8443` mTLS |
 | `ops-mcp` | Enterprise MCP server (runbooks, tickets), Streamable HTTP, OAuth per tool | internal `8443` mTLS |
-| `pki-init`, `spire-register` | One-shot jobs: node-attestation PKI (both domains), demo TLS CA, SPIFFE federation bootstrap, registration entries | – |
+| `ldap` | OpenLDAP directory (`dc=demo,dc=local`): people with `icamEntitlement`, agents as `icamAgent` non-person entities. Custom schema in `directory/icam.schema`. | internal `389` |
+| `directory-sync` | Directory → runtime every 10 s: SPIRE entries for active agents (revokes the rest) and the effective IdP policy | – |
+| `pki-init`, `spire-register` | One-shot jobs: node-attestation PKI (both domains), demo enterprise PKI (root, SPIRE and TLS issuing CAs), SPIFFE federation bootstrap, infrastructure registration entries | – |
 | `spire-server-partner`, `spire-agent-partner` | The external partner's SPIRE (trust domain `partner.example`), federated with `demo.local` via bundle endpoints | internal |
 | `partner-as` | Partner's authorization server: redeems JWT-bearer grants from `demo.local`, issues its own tokens | internal `8443` mTLS |
 | `partner-api` | Partner's external API (vendor service status, support cases). Accepts only partner-AS tokens. | internal `8443` mTLS |
@@ -129,9 +139,46 @@ Steps 11–14 run when the system depends on a partner's service. `payments-api`
 The UI shows every step with its details. Steps 9, 12 and 13 render the scope intersections,
 and steps 10 and 14 show each call's allow/deny decision.
 
+## Hybrid identity: directory + enterprise PKI + SPIFFE
+
+```
+ LDAP  ou=people  (credentials, icamEntitlement)  ──► PingFederate: LDAP PCV + LDAP attribute source
+       ou=agents  (icamAgent: sponsor, lifecycle,  ──► directory-sync ──► SPIRE registration entries
+                   expiry, recertified, ceiling,                     └──► OAuth clients (enabled, ceiling)
+                   selectors, allowed resources)
+
+ Demo Enterprise Root CA ─┬─ SPIRE Issuing CA ── SPIRE CA (rotates) ── X.509-SVIDs (1 h)
+                          └─ TLS Issuing CA ──── PingFederate HTTPS
+```
+
+| Layer | Source of truth | What it gives you |
+|---|---|---|
+| **Governance**: who an agent is, who sponsors it, whether it's still approved | LDAP `ou=agents` (`icamLifecycleStatus`, `icamExpires`, `icamLastRecertified`, `icamSponsor`) | Ordinary IGA: owners, recertification, joiner-mover-leaver. Browse it at http://localhost:8080/directory. |
+| **Ceiling**: the most an agent may ever do | LDAP `icamScopeCeiling`, `icamAllowedResource` | Rendered into each agent's OAuth client (restricted scopes) |
+| **User entitlements** | LDAP `icamEntitlement` on the person | Read at token issuance (PingFederate LDAP attribute source / simulator LDAP lookup) |
+| **Runtime credential** | SPIRE, attested by `icamWorkloadSelector` | Keys never leave the workload; 1 h SVIDs; no secret distribution |
+| **Trust anchor** | Demo enterprise root CA | SVIDs and PingFederate's cert validate against one root that legacy stacks can trust. SPIRE CA rotation changes only an intermediate. |
+| **Per-request authority** | OAuth delegation (unchanged) | User ∩ agent ceiling ∩ task, bound to the SVID |
+
+**Revocation is directory-driven and doesn't wait for certificate expiry.** Disable or expire an
+agent in LDAP and, within one sync interval, `directory-sync` deletes its SPIRE entry, so new
+instances get no SVID. It also disables its OAuth client, so even an SVID fetched earlier, still
+valid for up to an hour, is refused at token exchange. `scripts/governance_checks.py` shows this
+with an SVID held across the change.
+
+Try it yourself (the admin password is `admin`; see `.env.example`):
+
+```bash
+printf 'dn: cn=remediation-agent,ou=agents,dc=demo,dc=local\nchangetype: modify\nreplace: icamLifecycleStatus\nicamLifecycleStatus: disabled\n' \
+  | docker compose exec -T ldap ldapmodify -x -H ldap://localhost -D cn=admin,dc=demo,dc=local -w admin
+docker compose logs directory-sync | tail -3   # "SPIRE: revoked spiffe://demo.local/agent/remediation-agent (...)"
+```
+
 ## The policy
 
-Defined in [`config/idp-policy.yaml`](config/idp-policy.yaml), which both IdP modes enforce. Each task
+Scopes, the portal client and federation rules are in [`config/idp-policy.yaml`](config/idp-policy.yaml).
+User entitlements and agent ceilings are in the directory ([`directory/seed.ldif`](directory/seed.ldif)).
+`directory-sync` merges them into the effective policy that both IdP modes enforce. Each task
 needs `systems:read systems:analyze metrics:read tickets:read tickets:write`.
 
 | | analysis-agent ceiling<br>`systems:read systems:analyze metrics:read tickets:read` | remediation-agent ceiling<br>`systems:read tickets:read tickets:write` |
@@ -174,7 +221,8 @@ agent only gets what the task asked for.
 ```
 docker-compose.yml               the stack
 docker-compose.pingfederate.yml  overlay: real PingFederate 13.1 instead of the simulator
-config/idp-policy.yaml           users, clients, agent ceilings, federation (egress) policy
+config/idp-policy.yaml           base policy: scopes, portal client, agent-client template, federation
+directory/                       OpenLDAP image: icam schema, ACLs, seed (people + agent NPEs)
 config/partner-policy.yaml       the external partner's own policy
 spire/                           server/agent config (demo.local + partner/), PKI, federation + registration
 services/icam/
@@ -185,7 +233,8 @@ services/icam/
   agent/                         runtime (per-task process) + agent instance
   resources/                     systems-api (REST) and ops-mcp (MCP)
   partner/                       the external partner: authorization server + API
-scripts/                         smoke test and security checks (both modes)
+  directory/                     LDAP access + directory-sync (SPIRE entries, effective policy)
+scripts/                         smoke, security and governance checks (both modes)
 pingfederate/                    real-PingFederate guide; license/ (git-ignored)
 ```
 
@@ -198,7 +247,13 @@ pingfederate/                    real-PingFederate guide; license/ (git-ignored)
 - Workload selectors use a single container label. In production, pin image digests
   (`docker:image_config_digest`) or use the Kubernetes attestor.
 - Werkzeug's development server serves the Python services.
-- Demo passwords, client secret and the pairwise salt are in `config/idp-policy.yaml`.
+- Demo passwords and service-account secrets: `.env.example`, `directory/seed.ldif`. The client
+  secret and pairwise salt are in `config/idp-policy.yaml`.
+- LDAP runs without TLS (`ldap://`) on the internal network, and the enterprise PKI keys are files.
+  In production use LDAPS and keep CA keys in an HSM. SPIRE supports HSM-backed and cloud-KMS
+  upstream authorities.
+- `directory-sync` polls every 10 s. A production version would use persistent search or a change
+  log, and the IGA tool would write lifecycle changes.
 - Both trust domains run on one Docker host and network. A real partner would be reachable only
   through its public endpoints: the SPIFFE bundle endpoint, its AS and its API. Its JWKS
   fetch from our IdP would go over the internet.
