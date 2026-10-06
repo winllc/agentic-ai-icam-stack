@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Issues the reverse proxy's certificate for the public host names (demo enterprise TLS issuing CA).
 set -euo pipefail
+if [[ ${PROXY_TLS:-true} == false ]]; then
+  echo "[proxy-cert] PROXY_TLS=false - TLS is terminated in front of the proxy, no certificate needed"; exit 0
+fi
 host() { printf '%s' "$1" | sed -E 's#^[a-z]+://##; s#[/:].*$##'; }
 portal=$(host "$PORTAL_PUBLIC_URL"); pf=$(host "$PF_PUBLIC_URL")
 san="DNS:$portal,DNS:$pf"

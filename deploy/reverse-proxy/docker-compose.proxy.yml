@@ -9,6 +9,10 @@
 #   docker compose -f docker-compose.yml [-f docker-compose.pingfederate.yml] \
 #     -f deploy/reverse-proxy/docker-compose.proxy.yml up -d --build --wait
 #
+# Behind a third-party TLS proxy or load balancer (it holds the certificate): PROXY_TLS=false.
+# This proxy then listens on plain HTTP (PROXY_HTTP_PORT, default 80) and the third party forwards
+# to it, keeping the Host header. PORTAL_PUBLIC_URL / PF_PUBLIC_URL stay https:// - what browsers use.
+#
 # Proxied: the portal and the IdP's browser endpoints (443). NOT proxied: everything between
 # workloads - token exchange with SVID client certificates (pingfederate:9032 / :9443), JWKS,
 # resources, Vault. A TLS-terminating proxy would strip the client certificate that RFC 8705
@@ -27,6 +31,7 @@ services:
     environment:
       PORTAL_PUBLIC_URL: ${PORTAL_PUBLIC_URL:?set PORTAL_PUBLIC_URL, e.g. https://portal.demo.test}
       PF_PUBLIC_URL: ${PF_PUBLIC_URL:?set PF_PUBLIC_URL, e.g. https://sso.demo.test}
+      PROXY_TLS: ${PROXY_TLS:-true}
     volumes:
       - spire-pki:/pki
       - ./deploy/reverse-proxy:/proxy:ro
@@ -44,14 +49,17 @@ services:
       PF_PUBLIC_URL: ${PF_PUBLIC_URL}
       # The simulator serves HTTP on 9031, real PingFederate HTTPS (override with PF_UPSTREAM).
       PF_UPSTREAM: ${PF_UPSTREAM:-http://pingfederate:9031}
+      # false: plain HTTP only, TLS terminated by a third-party proxy in front of this one.
+      PROXY_TLS: ${PROXY_TLS:-true}
     entrypoint: ["/bin/sh", "/proxy/entrypoint.sh"]
     volumes:
       - spire-pki:/pki:ro
       - ./deploy/reverse-proxy:/proxy:ro
     ports:
-      - "${PROXY_HTTPS_PORT:-443}:443"
+      - "${PROXY_HTTPS_PORT:-443}:443"   # PROXY_TLS=true
+      - "${PROXY_HTTP_PORT:-80}:80"      # PROXY_TLS=false: the third-party proxy's upstream; else redirects to HTTPS
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider --no-check-certificate https://127.0.0.1/healthz || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/healthz || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 30

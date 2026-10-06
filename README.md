@@ -322,6 +322,7 @@ Browsers use two URLs; everything else talks container to container. Both URLs c
 | `PF_PUBLIC_URL` | `http://localhost:9031` (simulator), `https://localhost:9031` (PingFederate) | the issuer (`iss`) every service, Vault and the partner AS validate, the discovery document's endpoints, **PingFederate's base URL** (set by `pf-configurator`), and an extra name on PingFederate's TLS certificate |
 | `TRUSTED_PROXY_HOPS` | `0` | how many proxies' `X-Forwarded-*` headers the portal trusts (0: ignored, so clients can't spoof them) |
 | `PF_ADMIN_PUBLIC_URL`, `PF_TLS_EXTRA_SANS` | | PingFederate's admin-console URL; more names on its certificate |
+| `PROXY_TLS` (example proxy) | `true` | `false`: plain HTTP only, behind a third-party TLS proxy |
 
 Containers keep using `pingfederate`, `systems-api` and so on. Agents, resources, Vault and the
 portal's back channel rewrite public IdP URLs to the internal name (`PF_INTERNAL_BASE`), so the
@@ -351,6 +352,21 @@ python3 scripts/smoke_test.py   # the scripts read the URLs from .env
 
 Trust `/pki/enterprise/root-ca.crt` from the `spire-pki` volume in your browser, or put your own
 certificate on the proxy (then set `PUBLIC_CA_BUNDLE` for the scripts).
+
+**Behind a third-party TLS proxy or load balancer** (an F5, a cloud load balancer, an ingress
+controller), set `PROXY_TLS=false`. The bundled proxy then listens on plain HTTP
+(`PROXY_HTTP_PORT`, default 80) and needs no certificate. The third party terminates TLS and forwards
+to it.
+- Keep the public URLs `https://`. Browsers use them; cookies stay `Secure` and redirects use HTTPS.
+- The third party must keep the `Host` header, which routes the portal and IdP host names.
+- The bundled proxy sets `X-Forwarded-Proto` from the public URL, never from the incoming request.
+- The hop from the third party to the bundled proxy is unencrypted, so keep it on a trusted network.
+  From the bundled proxy to real PingFederate stays HTTPS, verified against the enterprise root.
+- Tested with a stand-in TLS proxy in front, in PingFederate mode. All three test scripts pass.
+
+You can also skip the bundled proxy: point the third party at `agentic-ai-service:8080` and
+`pingfederate:9031`. Real PingFederate only serves HTTPS there, so the third party must re-encrypt
+to it.
 
 ## Demo shortcuts (not for production)
 

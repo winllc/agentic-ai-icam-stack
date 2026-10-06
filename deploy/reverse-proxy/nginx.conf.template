@@ -1,28 +1,28 @@
-# Rendered by entrypoint.sh: ${PORTAL_HOST}, ${PF_HOST}, ${PF_UPSTREAM}.
-ssl_certificate     /pki/proxy/proxy-fullchain.crt;
-ssl_certificate_key /pki/proxy/proxy.key;
-ssl_protocols       TLSv1.2 TLSv1.3;
+# Rendered by entrypoint.sh: ${PORTAL_HOST}, ${PF_HOST}, ${PF_UPSTREAM}, ${LISTEN}, ${PUBLIC_SCHEME}.
+include /etc/nginx/tls.inc;            # certificate (PROXY_TLS=true) or empty
 
 proxy_set_header Host              $host;
 proxy_set_header X-Forwarded-Host  $host;
-proxy_set_header X-Forwarded-Proto https;
+proxy_set_header X-Forwarded-Proto ${PUBLIC_SCHEME};
 proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-proxy_read_timeout 240s;           # agent runs take a while
+proxy_read_timeout 240s;               # agent runs take a while
 
-server {                           # anything else: health check only
-  listen 443 ssl default_server;
+server {                               # anything else: health check only
+  listen ${LISTEN} default_server;
   location = /healthz { return 200 "ok\n"; }
   location / { return 421; }
 }
 
+include /etc/nginx/http-redirect.inc;  # PROXY_TLS=true: port 80 redirects to HTTPS
+
 server {
-  listen 443 ssl;
+  listen ${LISTEN};
   server_name ${PORTAL_HOST};
   location / { proxy_pass http://agentic-ai-service:8080; }
 }
 
 server {
-  listen 443 ssl;
+  listen ${LISTEN};
   server_name ${PF_HOST};
   location / {
     proxy_pass ${PF_UPSTREAM};
