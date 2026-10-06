@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 
@@ -32,6 +33,17 @@ SOCK = os.environ.get("SPIRE_SERVER_SOCKET", "/tmp/spire-server/private/api.sock
 TRUST_DOMAIN = os.environ.get("SPIFFE_TRUST_DOMAIN", "demo.local")
 PARENT = os.environ.get("AGENT_PARENT_ID", f"spiffe://{TRUST_DOMAIN}/node/docker-host")
 AGENT_PREFIX = f"spiffe://{TRUST_DOMAIN}/agent/"
+# Deployment-specific values the base policy may reference as ${NAME} or ${NAME:-default}.
+POLICY_VARS = {"PORTAL_PUBLIC_URL": os.environ.get("PORTAL_PUBLIC_URL", "http://localhost:8080").rstrip("/")}
+
+
+def load_base_policy() -> dict:
+    def sub(m):
+        value = POLICY_VARS.get(m.group(1)) or m.group(2)
+        if value is None:
+            raise ValueError(f"{BASE_POLICY}: ${{{m.group(1)}}} is not a known setting")
+        return value
+    return yaml.safe_load(re.sub(r"\$\{([A-Z0-9_]+)(?::-([^}]*))?\}", sub, open(BASE_POLICY).read()))
 
 
 # ------------------------------------------------------------------ SPIRE
@@ -130,7 +142,7 @@ def main():
     log.info("syncing %s every %ss -> SPIRE (%s) + %s", directory.agents_base, INTERVAL, PARENT, EFFECTIVE)
     while True:
         try:
-            base = yaml.safe_load(open(BASE_POLICY))
+            base = load_base_policy()
             agents = directory.agents()
             sponsors = {a["sponsor"]: directory.sponsor_name(a["sponsor"]) for a in agents}
             for action in reconcile_spire(agents):

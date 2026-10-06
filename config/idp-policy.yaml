@@ -27,7 +27,8 @@ clients:
     client_secret: portal-secret
     grant_types: [authorization_code]
     require_pkce: true
-    redirect_uris: [http://localhost:8080/callback]
+    # ${PORTAL_PUBLIC_URL} is filled in by directory-sync (default http://localhost:8080).
+    redirect_uris: ["${PORTAL_PUBLIC_URL}/callback"]
     allowed_scopes: [openid, profile, email, systems:read, systems:analyze, metrics:read, tickets:read, tickets:write,
                      partner:status.read, partner:cases.write]
     access_token_audience: agentic-ai-service

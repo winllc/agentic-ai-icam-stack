@@ -227,6 +227,16 @@ def configure_runtime_tls(api: Api):
         dst.write(src.read())
 
 
+def configure_base_url(api: Api):
+    """PingFederate builds discovery, endpoint URLs and the ID token issuer from its base URL:
+    it must be the public URL browsers use (PF_ISSUER), e.g. behind a reverse proxy."""
+    info = api.get("/serverSettings/federationInfo")
+    if info.get("baseUrl", "").rstrip("/") != ISSUER:
+        info["baseUrl"] = ISSUER
+        api.call("PUT", "/serverSettings/federationInfo", info)
+        log.info("base URL set to %s", ISSUER)
+
+
 def configure_scopes(api: Api):
     bad = [n for n in POLICY["scopes"] if not re.fullmatch(r"[A-Za-z0-9:._-]+", n)]
     if bad:  # scope names are embedded in OGNL regexes below
@@ -585,6 +595,7 @@ def sync_spire_trust(api: Api, identity: WorkloadIdentity) -> str:
 def configure_all(api: Api, identity: WorkloadIdentity) -> str:
     bootstrap(api)
     configure_runtime_tls(api)
+    configure_base_url(api)
     configure_scopes(api)
     configure_authentication(api)
     configure_user_tokens(api)
@@ -615,6 +626,7 @@ def main():
             if (new_hash := hashlib.sha256(open(POLICY_PATH, "rb").read()).hexdigest()) != POLICY_HASH:
                 # The directory changed (agent lifecycle, ceiling, resources): re-apply the agent clients.
                 POLICY_HASH = load_policy()
+                configure_user_tokens(api)          # portal redirect URIs follow PORTAL_PUBLIC_URL
                 configure_delegation(api, issuer_dn)
                 log.info("directory change applied: %s", ", ".join(
                     f"{k}={'enabled' if c.get('enabled', True) else 'disabled'}"

@@ -17,6 +17,7 @@ import requests
 from flask import Flask, abort, redirect, render_template, request, session, url_for
 
 from icam.common import logs
+from icam.common.web import behind_proxy
 from icam.common.tokens import JwtValidator, TokenError, unverified_claims
 
 log = logs.setup("agentic-ai-service")
@@ -26,8 +27,8 @@ INTERNAL = os.environ.get("PF_INTERNAL_BASE", ISSUER).rstrip("/")  # container-f
 PF_TLS = os.environ.get("PF_TLS_CA") or True                      # CA for PingFederate's HTTPS
 CLIENT_ID = os.environ.get("OIDC_CLIENT_ID", "agentic-ai-portal")
 CLIENT_SECRET = os.environ.get("OIDC_CLIENT_SECRET", "portal-secret")
-REDIRECT_URI = os.environ.get("OIDC_REDIRECT_URI", "http://localhost:8080/callback")
-PUBLIC_URL = os.environ.get("PUBLIC_URL", "http://localhost:8080")
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "http://localhost:8080").rstrip("/")   # as browsers see it
+REDIRECT_URI = os.environ.get("OIDC_REDIRECT_URI") or PUBLIC_URL + "/callback"
 SCOPES = os.environ.get("OIDC_SCOPES",
                         "openid profile email systems:read systems:analyze metrics:read tickets:read tickets:write "
                         "partner:status.read partner:cases.write")
@@ -46,6 +47,7 @@ EXAMPLE_TASKS = [
 app = Flask(__name__)
 app.secret_key = os.environ.get("PORTAL_SESSION_KEY") or secrets.token_hex(32)
 app.config.update(SESSION_COOKIE_NAME="ai_portal", SESSION_COOKIE_SAMESITE="Lax")
+behind_proxy(app, PUBLIC_URL)
 store: dict[str, dict] = {}  # server-side session data (tokens never go to the browser cookie)
 _disco: dict = {}
 

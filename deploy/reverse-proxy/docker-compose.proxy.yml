@@ -1,0 +1,61 @@
+# Overlay: put the browser-facing endpoints behind a TLS-terminating reverse proxy (nginx),
+# reached through real DNS names. An example of the pattern, and how the demo tests it.
+#
+#   # .env
+#   PORTAL_PUBLIC_URL=https://portal.demo.test
+#   PF_PUBLIC_URL=https://sso.demo.test
+#   TRUSTED_PROXY_HOPS=1
+#
+#   docker compose -f docker-compose.yml [-f docker-compose.pingfederate.yml] \
+#     -f deploy/reverse-proxy/docker-compose.proxy.yml up -d --build --wait
+#
+# Proxied: the portal and the IdP's browser endpoints (443). NOT proxied: everything between
+# workloads - token exchange with SVID client certificates (pingfederate:9032 / :9443), JWKS,
+# resources, Vault. A TLS-terminating proxy would strip the client certificate that RFC 8705
+# client authentication and the cnf binding depend on.
+#
+# The proxy's certificate is issued by the demo enterprise TLS issuing CA (trust
+# spire-pki:/pki/enterprise/root-ca.crt, as for PingFederate). Use your own in production.
+
+services:
+  proxy-cert:
+    image: agentic-icam/spire-tools:latest
+    command: ["/bin/bash", "/proxy/issue-cert.sh"]
+    depends_on:
+      pki-init:
+        condition: service_completed_successfully
+    environment:
+      PORTAL_PUBLIC_URL: ${PORTAL_PUBLIC_URL:?set PORTAL_PUBLIC_URL, e.g. https://portal.demo.test}
+      PF_PUBLIC_URL: ${PF_PUBLIC_URL:?set PF_PUBLIC_URL, e.g. https://sso.demo.test}
+    volumes:
+      - spire-pki:/pki
+      - ./deploy/reverse-proxy:/proxy:ro
+
+  reverse-proxy:
+    image: nginx:${NGINX_VERSION:-1.27-alpine}
+    restart: unless-stopped
+    depends_on:
+      proxy-cert:
+        condition: service_completed_successfully
+      agentic-ai-service:
+        condition: service_healthy
+    environment:
+      PORTAL_PUBLIC_URL: ${PORTAL_PUBLIC_URL}
+      PF_PUBLIC_URL: ${PF_PUBLIC_URL}
+      # The simulator serves HTTP on 9031, real PingFederate HTTPS (override with PF_UPSTREAM).
+      PF_UPSTREAM: ${PF_UPSTREAM:-http://pingfederate:9031}
+    entrypoint: ["/bin/sh", "/proxy/entrypoint.sh"]
+    volumes:
+      - spire-pki:/pki:ro
+      - ./deploy/reverse-proxy:/proxy:ro
+    ports:
+      - "${PROXY_HTTPS_PORT:-443}:443"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider --no-check-certificate https://127.0.0.1/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  agentic-ai-service:
+    environment:
+      TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-1}

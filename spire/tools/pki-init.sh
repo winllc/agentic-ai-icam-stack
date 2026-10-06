@@ -65,21 +65,33 @@ issuing_ca() {   # issuing_ca <name> <CN>
 issuing_ca tls-issuing-ca "Demo Enterprise TLS Issuing CA"
 
 mkdir -p tls
+# PingFederate's names: the container name, localhost, the host of PF_PUBLIC_URL and PF_TLS_EXTRA_SANS
+# (comma-separated, e.g. "DNS:sso.example.com,IP:10.0.0.5").
+pf_host=$(printf '%s' "${PF_PUBLIC_URL:-}" | sed -E 's#^[a-z]+://##; s#[/:].*$##')
+pf_san="DNS:pingfederate,DNS:localhost"
+if [[ -n $pf_host && $pf_host != localhost && $pf_host != pingfederate ]]; then
+  if [[ $pf_host =~ ^[0-9.]+$ ]]; then pf_san+=",IP:$pf_host"; else pf_san+=",DNS:$pf_host"; fi
+fi
+[[ -n ${PF_TLS_EXTRA_SANS:-} ]] && pf_san+=",${PF_TLS_EXTRA_SANS// /}"
 if [[ -f tls/pingfederate.crt ]] && ! chains tls/pingfederate.crt $E/tls-issuing-ca.crt; then
   echo "[pki-init] PingFederate certificate does not chain to the current root (older volume) - re-issuing"
+  rm -f tls/pingfederate.p12 tls/pingfederate.crt tls/pingfederate.key
+elif [[ -f tls/pingfederate.crt && "$(cat tls/pingfederate.san 2>/dev/null)" != "$pf_san" ]]; then
+  echo "[pki-init] PingFederate host names changed ($pf_san) - re-issuing"
   rm -f tls/pingfederate.p12 tls/pingfederate.crt tls/pingfederate.key
 fi
 if [[ ! -f tls/pingfederate.p12 ]]; then
   echo "[pki-init] issuing PingFederate server certificate (TLS issuing CA)"
   openssl req -newkey rsa:2048 -nodes -keyout tls/pingfederate.key -out tls/pingfederate.csr \
     -subj "/C=US/O=Agentic AI ICAM Demo/CN=pingfederate"
-  printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:pingfederate,DNS:localhost\n' > tls/pingfederate.ext
+  printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=%s\n' "$pf_san" > tls/pingfederate.ext
   openssl x509 -req -in tls/pingfederate.csr -CA $E/tls-issuing-ca.crt -CAkey $E/tls-issuing-ca.key \
     -CAcreateserial -out tls/pingfederate.crt -days 825 -extfile tls/pingfederate.ext
   cat $E/tls-issuing-ca.crt > tls/pingfederate-chain.crt
   openssl pkcs12 -export -in tls/pingfederate.crt -inkey tls/pingfederate.key -certfile tls/pingfederate-chain.crt \
     -name runtime-tls -out tls/pingfederate.p12 -passout pass:"${PF_TLS_P12_PASSWORD:-changeit}"
   rm -f tls/pingfederate.csr tls/pingfederate.ext
+  printf '%s' "$pf_san" > tls/pingfederate.san
 fi
 server_cert() {   # server_cert <name> <SAN list> - issued by the TLS issuing CA, with chain
   local n=$1 san=$2

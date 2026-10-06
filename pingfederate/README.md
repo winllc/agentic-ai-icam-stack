@@ -26,6 +26,9 @@ python3 scripts/smoke_test.py && python3 scripts/security_checks.py
 - PingFederate's TLS certificate chains to the **Demo Enterprise Root CA** created by `pki-init`.
   To stop browser warnings, trust that root:
   `docker compose cp pki-init:/pki/enterprise/root-ca.crt .` (or copy it out of the `spire-pki` volume).
+- Other host names or a reverse proxy: set `PF_PUBLIC_URL` (and `PF_ADMIN_PUBLIC_URL`). See
+  [Public URLs](../README.md#public-urls-dns-and-reverse-proxies). Keep port 9032 internal, because agents
+  authenticate there with client certificates.
 - Delete `-v` volumes with `docker compose -f docker-compose.yml -f docker-compose.pingfederate.yml down -v`.
 
 ## What `pf-configurator` creates
@@ -46,7 +49,8 @@ python3 scripts/smoke_test.py && python3 scripts/security_checks.py
 | delegated token | JWT ATM `delegatedatm` (5 min) with resource URIs. Mapping from the policy (OGNL over `context.HttpRequest`) adds:<br>`act = {"sub": "spiffe://demo.local/agent/<client>"}`<br>`cnf = {"x5t#S256": SHA-256 of the client's mTLS certificate}`<br>`aud = requested resource(s)` |
 | User ∩ Agent ∩ Requested | **Agent:** PingFederate rejects scopes outside the client's restricted scopes (`invalid_scope`).<br>**User:** an issuance criterion rejects any requested scope not in the subject token's `entitlements` and `scope`.<br>**Resources:** a second criterion allows only the registered resource servers. |
 | federation grant (steps 11–12) | JWT ATM `fedgrantpartnerexample` (1 min), selected by `resource = https://partner-as:8443`, from the same processor policy. The mapping computes a **pairwise `sub`** (SHA-256 of user, trust domain and salt in OGNL, identical to the simulator) and adds `act`, `cnf` and `aud`. Criteria: User bound, exactly the partner AS as resource, only that partner's egress scopes. Agent clients aren't restricted to the default ATM, so `resource` can select it. The internal mapping rejects egress scopes. |
-| runtime TLS | `runtime-tls` key pair from the **enterprise TLS issuing CA** (`pki-init`), SAN `pingfederate`, `localhost` |
+| `PF_PUBLIC_URL` | **Base URL** (Server Settings → Federation Info), so discovery, endpoints and the ID-token issuer use the public URL. The ATMs' `iss` uses the same value. |
+| runtime TLS | `runtime-tls` key pair from the **enterprise TLS issuing CA** (`pki-init`), SAN `pingfederate`, `localhost`, the `PF_PUBLIC_URL` host and `PF_TLS_EXTRA_SANS`. Re-issued and re-activated when the names change. |
 | mTLS listener | `PF_ENGINE_SECONDARY_PORT=9032`: agents call `https://pingfederate:9032/as/token.oauth2` |
 | SPIRE trust | Enterprise root (the SPIFFE bundle) plus the intermediates in the SVID chain (the current SPIRE CA and the SPIRE issuing CA) in **Trusted CAs**. PingFederate matches a client's issuer DN against a trusted CA, so the rotating SPIRE CA must be present. |
 

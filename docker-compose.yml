@@ -15,6 +15,7 @@
 #   Vault: SPIRE's upstream CA + dynamic database users for agents (delegated-token login)
 #
 # `docker compose up --build` then open http://localhost:8080 (alice/alice or bob/bob).
+# Behind real DNS / a reverse proxy: set PORTAL_PUBLIC_URL and PF_PUBLIC_URL in .env (see README).
 
 name: agentic-icam
 
@@ -37,8 +38,8 @@ x-ldap-idp-env: &ldap-idp-env
 
 x-python-env: &python-env
   SPIFFE_ENDPOINT_SOCKET: unix:///run/spire/sockets/agent.sock
-  # Browser-facing issuer vs. the name containers use to reach the AS.
-  PF_ISSUER: http://localhost:9031
+  # Browser-facing issuer (PF_PUBLIC_URL) vs. the name containers use to reach the AS.
+  PF_ISSUER: ${PF_PUBLIC_URL:-http://localhost:9031}
   PF_INTERNAL_BASE: http://pingfederate:9031
   PF_JWKS_URL: http://pingfederate:9031/pf/JWKS
   PF_DISCOVERY_URL: http://pingfederate:9031/.well-known/openid-configuration
@@ -67,6 +68,10 @@ services:
         SPIRE_VERSION: *spire-version
     image: agentic-icam/spire-tools:latest
     command: ["pki-init.sh"]
+    environment:
+      # PingFederate's HTTPS certificate also names the public host (for proxies that pass TLS through).
+      PF_PUBLIC_URL: ${PF_PUBLIC_URL:-https://localhost:9031}
+      PF_TLS_EXTRA_SANS: ${PF_TLS_EXTRA_SANS:-}
     volumes:
       - spire-pki:/pki
       - spire-server-data:/spire-server-data
@@ -234,6 +239,7 @@ services:
       LDAP_BIND_DN: cn=directory-sync,ou=services,dc=demo,dc=local
       LDAP_BIND_PASSWORD: ${LDAP_SYNC_PASSWORD:-sync-secret}
       BASE_POLICY: /config/idp-policy.yaml
+      PORTAL_PUBLIC_URL: ${PORTAL_PUBLIC_URL:-http://localhost:8080}   # fills ${PORTAL_PUBLIC_URL} in the policy (redirect URI)
       EFFECTIVE_POLICY: /policy/effective-policy.yaml
       SYNC_INTERVAL: "10"
     volumes:
@@ -299,7 +305,7 @@ services:
         condition: service_healthy
     environment:
       IDP_JWKS_URL: http://pingfederate:9031/pf/JWKS
-      IDP_ISSUER: http://localhost:9031
+      IDP_ISSUER: ${PF_PUBLIC_URL:-http://localhost:9031}
     volumes:
       - spire-pki:/pki:ro
       - vault-keys:/vault-keys:ro
@@ -313,8 +319,9 @@ services:
       HEALTH_PORT: "8080"
       OIDC_CLIENT_ID: agentic-ai-portal
       OIDC_CLIENT_SECRET: portal-secret
-      OIDC_REDIRECT_URI: http://localhost:8080/callback
-      PUBLIC_URL: http://localhost:8080
+      PUBLIC_URL: ${PORTAL_PUBLIC_URL:-http://localhost:8080}          # redirect URI = PUBLIC_URL/callback
+      TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-0}   # honor X-Forwarded-* from this many proxies
+      PORTAL_SESSION_KEY: ${PORTAL_SESSION_KEY:-}
       EFFECTIVE_POLICY: /policy/effective-policy.yaml
     depends_on:
       pingfederate:
@@ -414,7 +421,7 @@ services:
       SPIFFE_ENDPOINT_SOCKET: unix:///run/spire/sockets/agent.sock
       PARTNER_POLICY: /config/partner-policy.yaml
       # demo.local's assertion issuer (the PingFederate simulator in this mode)
-      ORIGIN_ISSUER: http://localhost:9031
+      ORIGIN_ISSUER: ${PF_PUBLIC_URL:-http://localhost:9031}
       ORIGIN_JWKS_URL: http://pingfederate:9031/pf/JWKS
       HEALTH_PORT: "8443"
     volumes:

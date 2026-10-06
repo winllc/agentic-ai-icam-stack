@@ -46,7 +46,8 @@ cp /path/to/pingfederate.lic pingfederate/license/pingfederate.lic && chmod 0644
 docker compose -f docker-compose.yml -f docker-compose.pingfederate.yml up -d --build --wait
 ```
 
-Open http://localhost:8080 and sign in as `alice/alice` or `bob/bob`. In mode B the login page
+Open http://localhost:8080 and sign in as `alice/alice` or `bob/bob` (other host names or a
+reverse proxy: see [Public URLs](#public-urls-dns-and-reverse-proxies)). In mode B the login page
 is PingFederate's own, at `https://localhost:9031`. Its certificate comes from a demo CA you can
 trust in your browser.
 
@@ -308,7 +309,48 @@ services/icam/
   vaultsetup/                    Vault init/unseal, SPIRE issuing CA, AppRole, JWT auth, database role
 scripts/                         smoke, security and governance checks (both modes)
 pingfederate/                    real-PingFederate guide; license/ (git-ignored)
+deploy/reverse-proxy/            example overlay: nginx in front of the portal and the IdP
 ```
+
+## Public URLs, DNS and reverse proxies
+
+Browsers use two URLs; everything else talks container to container. Both URLs come from `.env`:
+
+| Setting | Default | Drives |
+|---|---|---|
+| `PORTAL_PUBLIC_URL` | `http://localhost:8080` | the portal's links and redirect URI (`<url>/callback`), the registered redirect URI in the IdP (`config/idp-policy.yaml` uses `${PORTAL_PUBLIC_URL}`, filled in by `directory-sync`), `Secure` cookies when HTTPS |
+| `PF_PUBLIC_URL` | `http://localhost:9031` (simulator), `https://localhost:9031` (PingFederate) | the issuer (`iss`) every service, Vault and the partner AS validate, the discovery document's endpoints, **PingFederate's base URL** (set by `pf-configurator`), and an extra name on PingFederate's TLS certificate |
+| `TRUSTED_PROXY_HOPS` | `0` | how many proxies' `X-Forwarded-*` headers the portal trusts (0: ignored, so clients can't spoof them) |
+| `PF_ADMIN_PUBLIC_URL`, `PF_TLS_EXTRA_SANS` | | PingFederate's admin-console URL; more names on its certificate |
+
+Containers keep using `pingfederate`, `systems-api` and so on. Agents, resources, Vault and the
+portal's back channel rewrite public IdP URLs to the internal name (`PF_INTERNAL_BASE`), so the
+proxy only carries browser traffic. Change the URLs and run `up -d` again. The certificate,
+PingFederate's base URL and the redirect URI follow without `down -v`.
+
+**What not to proxy:** the token-exchange endpoint agents use (`pingfederate:9032`, simulator
+`:9443`). Agents authenticate there with their SVID as a TLS client certificate, and the delegated
+token is bound to it (`cnf`). A proxy that terminates TLS would strip that certificate. Keep it
+internal, or use TLS passthrough.
+
+`deploy/reverse-proxy/` is a working example: nginx terminating TLS for both host names, with a
+certificate from the demo enterprise CA. The three test scripts pass through it in both modes.
+
+```bash
+# /etc/hosts (or real DNS): 127.0.0.1 portal.demo.test sso.demo.test
+cat >> .env <<'EOF'
+PORTAL_PUBLIC_URL=https://portal.demo.test
+PF_PUBLIC_URL=https://sso.demo.test
+TRUSTED_PROXY_HOPS=1
+# PF_UPSTREAM=https://pingfederate:9031     # with docker-compose.pingfederate.yml
+EOF
+docker compose -f docker-compose.yml [-f docker-compose.pingfederate.yml] \
+  -f deploy/reverse-proxy/docker-compose.proxy.yml up -d --build --wait
+python3 scripts/smoke_test.py   # the scripts read the URLs from .env
+```
+
+Trust `/pki/enterprise/root-ca.crt` from the `spire-pki` volume in your browser, or put your own
+certificate on the proxy (then set `PUBLIC_CA_BUNDLE` for the scripts).
 
 ## Demo shortcuts (not for production)
 

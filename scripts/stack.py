@@ -9,18 +9,38 @@ from urllib.parse import urljoin
 
 import requests
 
-PORTAL = "http://localhost:8080"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def setting(name: str, default: str | None = None) -> str | None:
+    """The environment, else the project's .env (what docker compose used), else the default."""
+    if os.environ.get(name):
+        return os.environ[name]
+    try:
+        for line in open(os.path.join(ROOT, ".env")):
+            key, _, value = line.strip().partition("=")
+            if key == name and value:
+                return value.strip().strip('"\'')
+    except FileNotFoundError:
+        pass
+    return default
+
+
+PORTAL = setting("PORTAL_PUBLIC_URL", "http://localhost:8080").rstrip("/")
+
+
+def _ca_from_container(container: str, path: str) -> str | None:
+    out = subprocess.run(["docker", "exec", container, "cat", path], capture_output=True, text=True)
+    if out.returncode != 0 or "BEGIN CERTIFICATE" not in out.stdout:
+        return None
+    local = os.path.join(tempfile.gettempdir(), f"agentic-icam-{container}-ca.pem")
+    with open(local, "w") as f:
+        f.write(out.stdout)
+    return local
 
 
 def _ca_from_configurator() -> str | None:
-    out = subprocess.run(["docker", "exec", "agentic-icam-pf-configurator-1", "cat", "/pf-trust/pf-ca.pem"],
-                         capture_output=True, text=True)
-    if out.returncode != 0 or "BEGIN CERTIFICATE" not in out.stdout:
-        return None
-    path = os.path.join(tempfile.gettempdir(), "agentic-icam-pf-ca.pem")
-    with open(path, "w") as f:
-        f.write(out.stdout)
-    return path
+    return _ca_from_container("agentic-icam-pf-configurator-1", "/pf-trust/pf-ca.pem")
 
 
 class Stack:
@@ -28,13 +48,16 @@ class Stack:
         self.ca = _ca_from_configurator()
         self.real_pf = self.ca is not None
         if self.real_pf:   # real PingFederate: HTTPS everywhere, mTLS on the secondary port
-            self.pf = "https://localhost:9031"
+            self.pf = setting("PF_PUBLIC_URL", "https://localhost:9031").rstrip("/")
             self.mtls_token_endpoint = "https://pingfederate:9032/as/token.oauth2"
             self.container_ca = "/pf-trust/pf-ca.pem"
         else:              # simulator
-            self.pf = "http://localhost:9031"
+            self.pf = setting("PF_PUBLIC_URL", "http://localhost:9031").rstrip("/")
             self.mtls_token_endpoint = "https://pingfederate:9443/as/token.oauth2"
             self.container_ca = None   # the simulator's TLS cert is an SVID: trust the SPIFFE bundle
+            if "https://" in (self.pf + PORTAL):   # behind an HTTPS proxy: its cert chains to the enterprise root
+                self.ca = _ca_from_container("agentic-icam-vault-1", "/pki/tls/trust-anchor.pem")
+        self.ca = setting("PUBLIC_CA_BUNDLE") or self.ca   # e.g. your proxy's public CA
         self.name = "PingFederate" if self.real_pf else "PingFederate simulator"
 
     def session(self) -> requests.Session:

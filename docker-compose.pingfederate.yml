@@ -8,7 +8,7 @@
 # clients) and keeps SPIRE's CA bundle in PingFederate's Trusted CAs.
 
 x-real-pf-env: &real-pf-env
-  PF_ISSUER: https://localhost:9031
+  PF_ISSUER: ${PF_PUBLIC_URL:-https://localhost:9031}
   PF_INTERNAL_BASE: https://pingfederate:9031
   PF_DISCOVERY_URL: https://pingfederate:9031/.well-known/openid-configuration
   PF_JWKS_URL: https://pingfederate:9031/pf/JWKS
@@ -31,7 +31,7 @@ services:
     environment: !override
       PING_IDENTITY_ACCEPT_EULA: "YES"
       PF_ENGINE_SECONDARY_PORT: "9032"        # mTLS listener for tls_client_auth
-      PF_ADMIN_PUBLIC_BASEURL: https://localhost:9999
+      PF_ADMIN_PUBLIC_BASEURL: ${PF_ADMIN_PUBLIC_URL:-https://localhost:9999}
     volumes: !override
       - ./pingfederate/license/pingfederate.lic:/opt/in/instance/server/default/conf/pingfederate.lic:ro
     ports: !override
@@ -66,7 +66,7 @@ services:
       PF_ADMIN_URL: https://pingfederate:9999
       PF_ADMIN_USER: ${PF_ADMIN_USER:-administrator}
       PF_ADMIN_PASSWORD: ${PF_ADMIN_PASSWORD:-2FederateM0re}
-      PF_ISSUER: https://localhost:9031
+      PF_ISSUER: ${PF_PUBLIC_URL:-https://localhost:9031}
       PF_POLICY: /policy/effective-policy.yaml
       PF_TRUST_DIR: /pf-trust
       SYNC_INTERVAL: "10"
@@ -97,7 +97,7 @@ services:
   vault-config:
     environment:
       IDP_JWKS_URL: https://pingfederate:9031/pf/JWKS
-      IDP_ISSUER: https://localhost:9031
+      IDP_ISSUER: ${PF_PUBLIC_URL:-https://localhost:9031}
       IDP_TLS_CA: /pki/tls/trust-anchor.pem
     depends_on:
       pf-configurator:
@@ -133,7 +133,7 @@ services:
 
   partner-as:
     environment:
-      ORIGIN_ISSUER: https://localhost:9031
+      ORIGIN_ISSUER: ${PF_PUBLIC_URL:-https://localhost:9031}
       ORIGIN_JWKS_URL: https://pingfederate:9031/pf/JWKS
       ORIGIN_TLS_CA: /pf-trust/pf-ca.pem
     volumes: !override

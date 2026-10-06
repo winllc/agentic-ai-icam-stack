@@ -40,6 +40,7 @@ from icam.directory.ldapdir import Directory
 from icam.common.spiffe_identity import WorkloadIdentity, peer_cert_from_environ, spiffe_ids, x5t_s256
 from icam.common.federation import TT_JWT, pairwise_subject
 from icam.common.tokens import scopes_of
+from icam.common.web import behind_proxy
 
 log = logs.setup("pingfederate-sim")
 
@@ -71,6 +72,7 @@ sessions: dict[str, str] = {}
 audit: deque = deque(maxlen=200)
 
 app = Flask(__name__)
+SECURE_COOKIES = behind_proxy(app, ISSUER)
 
 
 # ---------------------------------------------------------------- helpers
@@ -209,7 +211,7 @@ def authorize():
     if request.method == "POST":
         sid = secrets.token_urlsafe(24)
         sessions[sid] = user
-        resp.set_cookie("PF", sid, httponly=True, samesite="Lax")
+        resp.set_cookie("PF", sid, httponly=True, samesite="Lax", secure=SECURE_COOKIES)
     return resp
 
 
