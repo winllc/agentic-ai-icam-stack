@@ -16,6 +16,7 @@ automatically.
 ```bash
 cp /path/to/pingfederate.lic pingfederate/license/pingfederate.lic   # never committed (.gitignore)
 chmod 0644 pingfederate/license/pingfederate.lic                      # PingFederate runs as uid 9031
+#   or leave it where it is:  echo PF_LICENSE_FILE=/path/to/pingfederate.lic >> .env
 docker compose -f docker-compose.yml -f docker-compose.pingfederate.yml up -d --build --wait
 python3 scripts/smoke_test.py && python3 scripts/security_checks.py
 ```

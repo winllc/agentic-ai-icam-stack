@@ -1,6 +1,7 @@
 # Overlay: run a real, licensed PingFederate instead of the simulator.
 #
 #   cp ~/pingfederate.lic pingfederate/license/pingfederate.lic   # readable by uid 9031
+#   (or keep it anywhere on the host: PF_LICENSE_FILE=/path/to/pingfederate.lic in .env)
 #   docker compose -f docker-compose.yml -f docker-compose.pingfederate.yml up -d --build --wait
 #
 # pf-configurator applies config/idp-policy.yaml through the admin API (scopes, users,
@@ -33,7 +34,14 @@ services:
       PF_ENGINE_SECONDARY_PORT: "9032"        # mTLS listener for tls_client_auth
       PF_ADMIN_PUBLIC_BASEURL: ${PF_ADMIN_PUBLIC_URL:-https://localhost:9999}
     volumes: !override
-      - ./pingfederate/license/pingfederate.lic:/opt/in/instance/server/default/conf/pingfederate.lic:ro
+      # PF_LICENSE_FILE: the license's location on the host (absolute, or relative to this directory).
+      # A missing file fails the start instead of Docker creating an empty directory in its place.
+      - type: bind
+        source: ${PF_LICENSE_FILE:-./pingfederate/license/pingfederate.lic}
+        target: /opt/in/instance/server/default/conf/pingfederate.lic
+        read_only: true
+        bind:
+          create_host_path: false
     ports: !override
       - "9031:9031"   # runtime (browser + back channel)
       - "9999:9999"   # admin console / admin API
