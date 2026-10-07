@@ -17,6 +17,7 @@ automatically.
 cp /path/to/pingfederate.lic pingfederate/license/pingfederate.lic   # never committed (.gitignore)
 chmod 0644 pingfederate/license/pingfederate.lic                      # PingFederate runs as uid 9031
 #   or leave it where it is:  echo PF_LICENSE_FILE=/path/to/pingfederate.lic >> .env
+#   or pass the content:      PF_LICENSE (multi-line) or PF_LICENSE_BASE64 - see below
 docker compose -f docker-compose.yml -f docker-compose.pingfederate.yml up -d --build --wait
 python3 scripts/smoke_test.py && python3 scripts/security_checks.py
 ```
@@ -27,6 +28,14 @@ python3 scripts/smoke_test.py && python3 scripts/security_checks.py
 - PingFederate's TLS certificate chains to the **Demo Enterprise Root CA** created by `pki-init`.
   To stop browser warnings, trust that root:
   `docker compose cp pki-init:/pki/enterprise/root-ca.crt .` (or copy it out of the `spire-pki` volume).
+- **License sources**, first match wins: `PF_LICENSE` (the file's content as a multi-line variable,
+  or one line with `\n` escapes), `PF_LICENSE_BASE64` (`base64 -w0 pingfederate.lic`), then
+  `PF_LICENSE_FILE` (a file, or a directory holding `pingfederate.lic`; default `pingfederate/license/`).
+  The variables suit deployment platforms with secret variables (Coolify, CI). A small entrypoint
+  (`pingfederate/license-entrypoint.sh`) writes the license and starts the image's normal bootstrap.
+  It strips Windows line endings and refuses content without an `ID=` line. It also removes the
+  variables from PingFederate's own process environment, though `docker inspect` still shows them.
+  Keep `.env` private.
 - Other host names or a reverse proxy: set `PF_PUBLIC_URL` (and `PF_ADMIN_PUBLIC_URL`). See
   [Public URLs](../README.md#public-urls-dns-and-reverse-proxies). Keep port 9032 internal, because agents
   authenticate there with client certificates.

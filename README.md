@@ -43,7 +43,8 @@ docker compose up -d --build --wait
 
 # B) Real PingFederate 13.1 (license file required; see pingfederate/README.md)
 cp /path/to/pingfederate.lic pingfederate/license/pingfederate.lic && chmod 0644 pingfederate/license/pingfederate.lic
-#   (or point at it instead: PF_LICENSE_FILE=/path/to/pingfederate.lic in .env)
+#   (or point at it instead: PF_LICENSE_FILE=/path/to/pingfederate.lic in .env,
+#    or pass its content: PF_LICENSE / PF_LICENSE_BASE64 - see pingfederate/README.md)
 docker compose -f docker-compose.yml -f docker-compose.pingfederate.yml up -d --build --wait
 ```
 
